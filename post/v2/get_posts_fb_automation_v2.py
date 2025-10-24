@@ -9,6 +9,8 @@ import json, re, time, random, urllib.parse, subprocess, os, sys, datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from get_info import *
+import socket
+
 # =========================
 # CONFIG — nhớ sửa GROUP_URL
 # =========================
@@ -30,17 +32,105 @@ os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
 # =========================
 # Boot
 # =========================
-def start_driver(chrome_path, user_data_dir, profile_name, port=REMOTE_PORT):
-    subprocess.Popen([
+def _wait_port(host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
+    """Return True if (host,port) becomes connectable within timeout."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except Exception:
+            time.sleep(poll)
+    return False
+
+def start_driver(chrome_path,
+                 user_data_dir,
+                 profile_name,
+                 port=9222,
+                 headless: bool = True,
+                 timeout: float = 15.0):
+    """
+    Start a real Chrome process and attach Selenium via remote debugging.
+
+    Args:
+        chrome_path: path to chrome/chromium executable.
+        user_data_dir: profile dir (keeps cookies/session).
+        profile_name: profile directory name (e.g. 'Default' or 'Profile 1').
+        port: remote debugging port.
+        headless: if True, start Chrome in headless (background) mode.
+        timeout: seconds to wait for remote port to become available.
+
+    Returns:
+        webdriver.Chrome instance (connected to the launched Chrome).
+    """
+    # build CLI args for Chrome instance
+    # keep remote-debugging-port + user profile. Add headless flags optionally.
+    args = [
         chrome_path,
         f'--remote-debugging-port={port}',
         f'--user-data-dir={user_data_dir}',
-        f'--profile-directory={profile_name}'
-    ])
-    time.sleep(2)
+        f'--profile-directory={profile_name}',
+        # useful flags to make an isolated, stable environment:
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-popup-blocking',
+        '--disable-default-apps',
+        '--disable-infobars'
+    ]
+
+    if headless:
+        # prefer new headless mode; adjust window size
+        args += [
+            '--headless=new',
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1920,1080'
+        ]
+
+    # Launch Chrome (separate process) that Selenium will attach to.
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Wait for remote debugging port to be ready
+    ok = _wait_port('127.0.0.1', port, timeout=timeout)
+    if not ok and headless:
+        # fallback: try again without headless (some sites require non-headless)
+        proc.kill()
+        time.sleep(0.5)
+        # try non-headless
+        args = [
+            chrome_path,
+            f'--remote-debugging-port={port}',
+            f'--user-data-dir={user_data_dir}',
+            f'--profile-directory={profile_name}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-popup-blocking',
+            '--disable-default-apps',
+            '--disable-infobars',
+            '--window-size=1920,1080'
+        ]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ok = _wait_port('127.0.0.1', port, timeout=timeout)
+        if not ok:
+            proc.kill()
+            raise RuntimeError(f"Chrome remote debugging port {port} not available after fallback start.")
+
+    if not ok:
+        proc.kill()
+        raise RuntimeError(f"Chrome remote debugging port {port} not available.")
+
+    # Attach Selenium to the running Chrome via debuggerAddress
     options = Options()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    return webdriver.Chrome(options=options)
+
+    # Important: do NOT also set options.headless here — we're attaching to the launched Chrome.
+    driver = webdriver.Chrome(options=options)
+    return driver
 
 # =========================
 # Hook /api/graphql/
@@ -434,6 +524,27 @@ def normalize_seen_ids(seen_ids):
     # Ở bản cũ bạn có thể đã lưu 'id' thuần; bản mới dùng rid (post_id | urlDigits | id).
     # Không có URL để suy ra digits, nên giữ nguyên chuỗi — Uzpf* vẫn match rid.
     return set(seen_ids or [])
+def reload_and_refresh_form(d, group_url, cursor, effective_template, timeout=25, poll=0.25):
+    """Reload trang, bắt lại 1 request feed mới để lấy form/doc_id/tokens mới,
+    rồi set lại variables theo cursor đang có và trả về form mới."""
+    d.get(group_url)
+    time.sleep(1.5)
+    for _ in range(4):
+        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));")
+        time.sleep(0.5)
+
+    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=timeout, poll=poll)
+    if not nxt:
+        return None, None, None  # không bắt được → để caller tự xử lý
+    _, req = nxt
+
+    new_form = parse_form(req.get("body", ""))
+    new_friendly = urllib.parse.parse_qs(req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
+    new_doc_id = new_form.get("doc_id")
+
+    # ghép lại variables dựa trên template + cursor hiện tại
+    new_form = update_vars_for_next_cursor(new_form, cursor, vars_template=effective_template)
+    return new_form, new_friendly, new_doc_id
 
 # =========================
 # MAIN
@@ -511,7 +622,7 @@ if __name__ == "__main__":
 
     # ======== PAGINATE (resume-first) ========
     no_progress_rounds = 0
-    while has_next:
+    while True:
         page += 1
         # if page == 20:
         #     print(f"[PAGE#{page}] reached page limit 20, stop.")
@@ -555,12 +666,33 @@ if __name__ == "__main__":
         save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=effective_template)
 
         if no_progress_rounds >= 3:
-            print(f"[PAGE#{page}] no new items 3 rounds → nudge UI + backoff")
-            for _ in range(2):
-                d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-                time.sleep(0.5)
+            print(f"[PAGE#{page}] no new items 3 rounds → reload & resume from checkpoint cursor")
+            # lưu checkpoint hiện tại (phòng trường hợp reload fail)
+            save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'),
+                            last_query_name=friendly, vars_template=effective_template)
+
+            # jitter nhỏ để tránh pattern
             time.sleep(random.uniform(2.0, 4.0))
-            no_progress_rounds = 0
+
+            # reload và bắt lại form/tokens mới rồi tiếp tục
+            new_form, new_friendly, new_doc_id = reload_and_refresh_form(
+                d, GROUP_URL, cursor, effective_template, timeout=25, poll=0.25
+            )
+            if new_form:
+                form = new_form
+                friendly = new_friendly or friendly
+                # có thể cập nhật last_doc_id nếu muốn theo dõi
+                # last_doc_id = new_doc_id or last_doc_id
+                no_progress_rounds = 0
+                # quay lại vòng lặp, gọi request tiếp theo luôn
+                continue
+            else:
+                # fallback cũ: nudge + backoff
+                for _ in range(2):
+                    d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
+                    time.sleep(0.5)
+                time.sleep(random.uniform(2.0, 4.0))
+                no_progress_rounds = 0
 
         time.sleep(random.uniform(0.7, 1.5))
 
