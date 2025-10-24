@@ -1,5 +1,8 @@
 {
-  "cursor": "Cg8Ob3JnYW5pY19jdXJzb3IJAAABxEFRSFNTODhoZVBERnR1NEM4ckhaR3FPN2kwV2haQjRVZkpic1ZyNGExYzNIRlA1NXJOYzVSaXAwZnoycmY0TXBNeUVUZzhOeG1Ba08wamUtWWs1SEZxelc1em5GTl92SlNqMFlUM2lHT1JtY3I5ZkdtWFRsd0pJOEFEa0pjWHZubDZoQTlFeUxTWUhaelo2SDJ2bmRrWE12Ym9FRGdIYkJiZ2YzSW50cE5FUTltaVFOSE1WMXU3N2hFaFhid29OMFZLeXpmMGdybDNrZmNCc09wZ3BBSllHV1AzQm1WYWxZODNsR041TGxYR19KMDRNd1c3Q3RhOUw5RDhHNGloSGsyVV9rMlZuRkFiTm9PRjQ2bWNuWDBpVkY1YnVnSGVPLXNUTDhKU2tzalF0MzZYeW9Edi1Rd2ZxRGdNcENwUU9jOGpXWHg2NXpfQVBxUDJnNFZaYzFiMFFKbUNaRlMxbWdsZi1nVlkySEZ6SDJsTWJHVXViM2habi1pZlJqMEVuRjF6eGFpeE5RZ1paMEdnbXBKRzFybDU3OXRtZTY5Si1GUkRPLW1tM3ZNWXF6SFRmYlRhWkdZbVdDQnFPR3poazFYV3RjDwlhZF9jdXJzb3IODw9nbG9iYWxfcG9zaXRpb24CAA8Gb2Zmc2V0AgAPEGxhc3RfYWRfcG9zaXRpb24C/wE=",
+  "cursor": "AQHSayL63vAHeLD4OEQHdkk7nhS3a2o5ReQuBbmWvAvvQ9Nd1l1a5MDQ4iNkVE1W0kDwaGR_Xrbk8101fcitqoGntkRDGznsw627eAh4MlBv1jePPeyakfiIP9ozsxkr0siaH9Xfp3GvWA1F_kdU-ErmqEwAI7aCSG_0_s0WRDrWNQHMmO44_LuBuMdvqxXbyLNQwiaUEoBYHB3HrFWPGeMc5kW2RydwDG4PrrNekqSfW71f0Ss04D9xvDIUGV7s70zz0_Azkbix3ebKBJbTRfqeYd7r_CuD_cVWr3r5M_BFj1yR42U1MFUQwJFLxAJVrGj1I5P74D4MYTSCOTS-cI1bswF23rJDjXPWsglX46iRuMALFrgP2pd6DTnBsT_yDDt_yTOr4l2leZ8QWmWZL0r5xcgwRlQMcp8jSa_7g7RtlM-bvJb4v71AICCa3mouAHLS",
+  "seen_ids": [],
+  "last_doc_id": "24733031923046880",
+  "last_query_name": "ProfileCometTimelineFeedRefetchQuery",
   "vars_template": {
     "afterTime": null,
     "beforeTime": null,
@@ -9,7 +12,9 @@
     "focusCommentID": null,
     "memorializedSplitTimeFilter": null,
     "omitPinnedPost": true,
-    "postedBy": { "group": "OWNER" },
+    "postedBy": {
+      "group": "OWNER"
+    },
     "privacy": null,
     "privacySelectorRenderLocation": "COMET_STREAM",
     "renderLocation": "timeline",
@@ -18,9 +23,9 @@
     "taggedInOnly": null,
     "trackingCode": null,
     "useDefaultActor": false,
-    "id": "61567685175561",
-    "__relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider": false,
-    "__relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider": false,
+    "id": "100064567130626",
+    "__relay_internal__pv__GHLShouldChangeAdIdFieldNamerelayprovider": true,
+    "__relay_internal__pv__GHLShouldChangeSponsoredDataFieldNamerelayprovider": true,
     "__relay_internal__pv__FBReels_enable_view_dubbed_audio_type_gkrelayprovider": false,
     "__relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider": false,
     "__relay_internal__pv__IsWorkUserrelayprovider": false,
@@ -36,11 +41,8 @@
     "__relay_internal__pv__CometUFI_dedicated_comment_routable_dialog_gkrelayprovider": false,
     "__relay_internal__pv__StoriesArmadilloReplyEnabledrelayprovider": true,
     "__relay_internal__pv__FBReelsIFUTileContent_reelsIFUPlayOnHoverrelayprovider": true,
-    "__relay_internal__pv__GroupsCometGYSJFeedItemHeightrelayprovider": 150,
+    "__relay_internal__pv__GroupsCometGYSJFeedItemHeightrelayprovider": 206,
     "__relay_internal__pv__StoriesShouldIncludeFbNotesrelayprovider": false
   },
-  "seen_ids": [],
-  "last_doc_id": null,
-  "last_query_name": null,
-  "ts": null
+  "ts": "2025-10-24T17:01:40"
 }

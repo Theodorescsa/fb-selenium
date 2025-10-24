@@ -1,421 +1,515 @@
-# -*- coding: utf-8 -*-
-import json, re, time, urllib.parse, subprocess, os, uuid
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
-REMOTE_PORT   = 9222
-GROUP_URL     = "https://web.facebook.com/groups/laptrinhvienit"
-GROUP_URL     = "https://www.facebook.com/ThuToiConfession"  # <— ĐỔI Ở ĐÂY
+"""
+Hàm main của dự án
+"""
+# import os
+# import sys
+# sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from utils.log_utils import logger
+import os
+#from src.scraper_manager_thread_with_db import ScarperManager
+from src.scraper_manager_thead import ScarperManager
+path_db = {
+    "PATH_GROUP" : "db/Groups",
+    "PATH_PAGE" : "db/Pages",
+    "PATH_ERROR" : "db/Error",
+    "PATH_LINK" : "db/Links",
+    "PATH_SEARCH" : "db/Search",
+    "PATH_SHARE_POST" : "db/Share_post",
+    "PATH_UPDATE" : "db/Update"
+}
 
-CHECKPOINT    = r"E:\NCS\fb-selenium\checkpoint.json"
-RAW_DUMPS_DIR = "raw_dumps"
-os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
+for key, val in path_db.items():
+    if not os.path.exists(val):
+        os.makedirs(val)
 
-def install_early_hook(driver, keep_last=350):
-    HOOK_SRC = r"""
-    (function(){
-      if (window.__gqlHooked) return;
-      window.__gqlHooked = true;
-      window.__gqlReqs = [];
-      function headersToObj(h){try{
-        if (!h) return {};
-        if (h instanceof Headers){const o={}; h.forEach((v,k)=>o[k]=v); return o;}
-        if (Array.isArray(h)){const o={}; for (const [k,v] of h) o[k]=v; return o;}
-        return (typeof h==='object')?h:{};
-      }catch(e){return {}}}
-      function pushRec(rec){try{
-        const q = window.__gqlReqs; q.push(rec);
-        if (q.length > __KEEP_LAST__) q.splice(0, q.length - __KEEP_LAST__);
-      }catch(e){}}
-      const origFetch = window.fetch;
-      window.fetch = async function(input, init){
-        const url = (typeof input==='string') ? input : (input&&input.url)||'';
-        const method = (init&&init.method)||'GET';
-        const body = (init && typeof init.body==='string') ? init.body : '';
-        const hdrs = headersToObj(init && init.headers);
-        let rec = null;
-        if (url.includes('/api/graphql/') && method==='POST'){
-          rec = {kind:'fetch', url, method, headers:hdrs, body:String(body)};
-        }
-        const res = await origFetch(input, init);
-        if (rec){
-          try{ rec.responseText = await res.clone().text(); }catch(e){ rec.responseText = null; }
-          pushRec(rec);
-        }
-        return res;
-      };
-      const XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.open = function(m,u,a){ this.__m=m; this.__u=u; return XO.apply(this, arguments); };
-      XMLHttpRequest.prototype.send = function(b){
-        this.__b = (typeof b==='string')?b:'';
-        this.addEventListener('load', ()=>{
-          try{
-            if ((this.__u||'').includes('/api/graphql/') && (this.__m||'')==='POST'){
-              pushRec({kind:'xhr', url:this.__u, method:this.__m, headers:{}, body:String(this.__b),
-                       responseText:(typeof this.responseText==='string'?this.responseText:null)});
-            }
-          }catch(e){}
-        });
-        return XS.apply(this, arguments);
-      };
-    })();
-    """.replace("__KEEP_LAST__", str(keep_last))
-    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": HOOK_SRC})
-    driver.execute_script(HOOK_SRC)
-
-def start_driver():
-    subprocess.Popen([
-        CHROME_PATH,
-        f'--remote-debugging-port={REMOTE_PORT}',
-        f'--user-data-dir={USER_DATA_DIR}',
-        f'--profile-directory={PROFILE_NAME}',
-    ])
-    time.sleep(2)
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{REMOTE_PORT}")
-    return webdriver.Chrome(options=options)
-
-def is_group_feed_req_body(body: str) -> bool:
-    if not body: return False
-    if "fb_api_req_friendly_name=" in body:
-        if re.search(r"(?:GroupComet|CometGroup|GroupsComet).*(?:Feed|Stories).*Pagination", body, re.I):
-            return True
-    qs = urllib.parse.parse_qs(body, keep_blank_values=True)
-    v = qs.get("variables", [""])[0]
-    try:
-        vj = json.loads(urllib.parse.unquote_plus(v))
-        if any(k in vj for k in ["groupID","groupIDV2","id"]) and any(
-            k in vj for k in ["after","cursor","endCursor","afterCursor","feedAfterCursor"]
-        ):
-            return True
-    except: pass
-    return False
-
-def parse_form(body: str):
-    qs = urllib.parse.parse_qs(body, keep_blank_values=True)
-    return {k:(v[0] if isinstance(v, list) else v) for k,v in qs.items()}
-
-# === robust JSON parsing ===
-def _strip_xssi_prefix(s: str) -> str:
-    if not s: return s
-    s2 = s.lstrip()
-    s2 = re.sub(r'^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*', '', s2)
-    s2 = re.sub(r"^\s*\)\]\}'\s*", '', s2)
-    return s2
-
-def iter_json_values(s: str):
-    dec = json.JSONDecoder()
-    i, n = 0, len(s)
-    while i < n:
-        m = re.search(r'\S', s[i:])
-        if not m: break
-        j = i + m.start()
-        try:
-            obj, k = dec.raw_decode(s, j); yield obj; i = k
-        except json.JSONDecodeError:
-            chunk = _strip_xssi_prefix(s[j:])
-            if chunk == s[j:]:
-                # nếu vẫn fail, cắt đoạn đến ký tự kết thúc gần nhất để tránh kẹt
-                end = s.rfind('}', j)
-                if end == -1: break
-                try:
-                    obj, k2 = dec.raw_decode(s[j:end+1], 0); yield obj; i = end+1
-                except json.JSONDecodeError:
-                    break
-            else:
-                try:
-                    obj, k_rel = dec.raw_decode(chunk, 0); yield obj; i = j + k_rel
-                except json.JSONDecodeError:
-                    break
-
-def choose_best_graphql_obj(objs):
-    objs = list(objs)
-    if not objs: return None
-    with_data = [o for o in objs if isinstance(o, dict) and 'data' in o]
-    pick = with_data or [o for o in objs if isinstance(o, dict)] or objs
-    return max(pick, key=lambda o: len(json.dumps(o, ensure_ascii=False)))
-
-def extract_first_story_text(obj: dict):
-    def find_story(n):
-        if isinstance(n, dict):
-            if n.get("__typename") == "Story":
-                if isinstance(n.get("message"), dict):
-                    t = n["message"].get("text")
-                    if t:
-                        return t
-                if isinstance(n.get("body"), dict):
-                    t = n["body"].get("text")
-                    if t:
-                        return t
-            for v in n.values():
-                t = find_story(v)
-                if t:
-                    return t
-        elif isinstance(n, list):
-            for v in n:
-                t = find_story(v)
-                if t: return t
-        return None
-    return find_story(obj)
-
-def choose_best_cursor(obj: dict):
-    def deep(o):
-        curs = []
-        if isinstance(o, dict):
-            pi = o.get("page_info") or o.get("pageInfo")
-            if isinstance(pi, dict):
-                ec = pi.get("end_cursor") or pi.get("endCursor")
-                if isinstance(ec, str) and len(ec) > 10: curs.append(("page_info.end_cursor", ec))
-            edges = o.get("edges")
-            if isinstance(edges, list) and edges:
-                last = edges[-1]
-                if isinstance(last, dict):
-                    c = last.get("cursor")
-                    if isinstance(c, str) and len(c) > 10: curs.append(("edges[-1].cursor", c))
-            for k, v in o.items():
-                if k in {"cursor","after","endCursor","afterCursor","feedAfterCursor"} and isinstance(v, str) and len(v) > 10:
-                    curs.append((k, v))
-                curs.extend(deep(v))
-        elif isinstance(o, list):
-            for v in o: curs.extend(deep(v))
-        return curs
-    cand = deep(obj)
-    if not cand: return None
-    prio = {"page_info.end_cursor":3, "end_cursor":3, "endCursor":3, "edges[-1].cursor":2}
-    cand.sort(key=lambda kv: (prio.get(kv[0],1), len(kv[1])), reverse=True)
-    return cand[0][1]
-def sanitize_headers(h: dict) -> dict:
-    """Giữ lại các header cần thiết cho GraphQL, bỏ những cái trình duyệt tự set."""
-    if not isinstance(h, dict): return {}
-    drop = {
-        "cookie","Cookie","host","Host","authority","Authority",
-        "content-length","Content-Length","accept-encoding","Accept-Encoding",
-        "connection","Connection","origin","Origin","referer","Referer",  # Referer/Origin để browser tự gắn
-        # thêm các header đặc thù có thể gây reject nếu sai:
-        "sec-ch-ua","Sec-CH-UA","sec-ch-ua-mobile","Sec-CH-UA-Mobile","sec-ch-ua-platform","Sec-CH-UA-Platform",
-        "user-agent","User-Agent"
-    }
-    out = {}
-    for k,v in h.items():
-        if k in drop: 
-            continue
-        out[k] = v
-    # đảm bảo 2 header quan trọng tồn tại nếu có trong body:
-    # (nhiều build của FB yêu cầu x-fb-friendly-name + x-fb-lsd)
-    return out
-# --- put these utilities next to your current helpers ---
-
-LIKELY_MSG_KEYS = {"message", "body", "title", "content", "textWithEntities"}
-
-def _pick_first_nonempty(*vals):
-    for v in vals:
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-def _get(d, *path):
-    cur = d
-    for k in path:
-        if not isinstance(cur, dict): return None
-        cur = cur.get(k)
-    return cur
-
-def extract_text_from_story_node(n: dict):
-    """
-    Try common comet paths first, then recursive fallback for any {..., "text": "..."} 
-    under keys that look like message/title/body.
-    """
-    if not isinstance(n, dict): 
-        return None
-
-    # 1) "simple" paths
-    t = _pick_first_nonempty(
-        _get(n, "message", "text"),
-        _get(n, "body", "text"),
-        _get(n, "title", "text"),
-        _get(n, "message", "textWithEntities", "text"),
+def main():
+    logger.warning(
+        
+    "\n                    _oo0oo_                      \n"
+    "                   o8888888o                       \n"
+    "                   88' . '88                       \n"
+    "                   (| -_- |)                       \n"
+    "                   0\  =  /0                       \n"
+    "                 ___/`---'\___                     \n"
+    "               .' \\|     |// '.                   \n"
+    "              / \\|||  :  |||// \                  \n"
+    "             / _||||| -:- |||||- \                 \n"
+    "            |   | \\\  -  /// |   |                \n"
+    "            | \_|  ''\---/''  |_/ |                \n"
+    "             \ .-\__  '-' ___/-. /                 \n"
+    "           ___'. .' /--.--\ `. .'___               \n"
+    "        ."" '< `.___\_<|>_/___.' >' "".            \n"
+    "      | | :  `- \`.;`\ _ /`;.`/ - ` : | |          \n"
+    "      \  \ `_.   \_ __\ /__ _/   .-` /  /          \n"
+    "  =====`-.____`.___ \_____/___.-`___.-'=====       \n"
+    "                    `=---='                        \n"
+    "            It works … on my machine               \n"
+    "  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~      \n"
+ 
     )
-    if t: return t
 
-    # 2) comet_sections variations (FB hay nhét text ở đây)
-    cs = n.get("comet_sections") or {}
-    if isinstance(cs, dict):
-        t = _pick_first_nonempty(
-            _get(cs, "message", "message", "text"),
-            _get(cs, "message", "story", "message", "text"),
-            _get(cs, "content", "story", "message", "text"),
-            _get(cs, "content", "message", "text"),
-            _get(cs, "context_layout", "story", "message", "text"),
-            _get(cs, "sub_message", "message", "text"),
-            _get(cs, "title", "story", "message", "text"),
-        )
-        if t: return t
+    sc = ScarperManager()
+    sc.run()
+    
 
-    # 3) attached / aggregated (share bài khác)
-    t = _pick_first_nonempty(
-        _get(n, "attached_story", "message", "text"),
-        _get(n, "attached_story", "comet_sections", "message", "message", "text"),
-        _get(n, "aggregated_story", "message", "text"),
-        _get(n, "aggregated_story", "comet_sections", "message", "message", "text"),
-    )
-    if t: return t
-
-    # 4) fallback: scan recursively for any dict under likely keys that has "text"
-    def deep(n, parent_key=None):
-        if isinstance(n, dict):
-            # if this node looks like {text: "..."} and parent_key signals content
-            if "text" in n and isinstance(n["text"], str) and parent_key in LIKELY_MSG_KEYS:
-                txt = n["text"].strip()
-                if txt:
-                    return txt
-            for k, v in n.items():
-                r = deep(v, k)
-                if r: return r
-        elif isinstance(n, list):
-            for v in n:
-                r = deep(v, parent_key)
-                if r: return r
-        return None
-
-    return deep(n)
-
-def extract_first_k_posts(obj: dict, k=1):
-    """Find the first K Story nodes; return list of dicts: {id, url, text}"""
-    out = []
-    def visit(n):
-        if len(out) >= k: 
-            return
-        if isinstance(n, dict):
-            if n.get("__typename") == "Story" or n.get("__isFeedUnit") == "Story":
-                fb_id = n.get("id")
-                url = n.get("wwwURL") or n.get("url")
-                text = extract_text_from_story_node(n)
-                out.append({"id": fb_id, "url": url, "text": text})
-            for v in n.values():
-                if len(out) >= k: break
-                visit(v)
-        elif isinstance(n, list):
-            for v in n:
-                if len(out) >= k: break
-                visit(v)
-    visit(obj)
-    return out
-
-def demo_resume_fetch_v3():
-    # 0) read checkpoint
-    with open(CHECKPOINT, "r", encoding="utf-8") as f:
-        state = json.load(f)
-    cursor = state.get("cursor")
-    vars_template = state.get("vars_template") or {}
-    if not cursor:
-        print("❌ Checkpoint không có cursor. Crawl 1 lần trước đã nha.")
-        return
-    print(f"[DEBUG] resume cursor={cursor[:28]}…")
-
-    # 1) start & hook
-    d = start_driver()
-    install_early_hook(d, keep_last=350)
-
-    # 2) open & scroll to trigger graphql
-    d.get(GROUP_URL)
-    time.sleep(1.2)
-    for _ in range(10):
-        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));")
-        time.sleep(0.5)
-
-    # 3) capture 1 fresh feed request
-    req = None
-    t_end = time.time() + 25
-    while time.time() < t_end and not req:
-        arr = d.execute_script("return (window.__gqlReqs||[])") or []
-        for r in reversed(arr):
-            if "/api/graphql/" in (r.get("url") or "") and is_group_feed_req_body(r.get("body") or ""):
-                req = r; break
-        time.sleep(0.3)
-    if not req:
-        print("❌ Không bắt được request feed mới (login/quyền/scroll?)."); return
-    req_headers = sanitize_headers(req.get("headers") or {})
-    print(f"[DEBUG] friendly-name hdr = {req_headers.get('x-fb-friendly-name')}")
-    # 4) parse fresh form
-    form = parse_form(req.get("body",""))
-    try:
-        vars_now = json.loads(urllib.parse.unquote_plus(form.get("variables","{}")))
-    except Exception:
-        vars_now = {}
-
-    # 5) merge template + inject cursor
-    eff = dict(vars_now)
-    for k,v in vars_template.items():
-        if k not in {"cursor","after","endCursor","afterCursor","feedAfterCursor"}:
-            eff[k] = v
-    placed = False
-    for key in ["cursor","after","endCursor","afterCursor","feedAfterCursor"]:
-        if key in eff:
-            eff[key] = cursor; placed = True; break
-    if not placed:
-        eff["cursor"] = cursor
-    form["variables"] = json.dumps(eff, separators=(",",":"))
-
-    # util: post & robust parse
-    def post_and_parse(fd, extra_headers):
-        script = """
-        const url = "/api/graphql/";
-        const form = arguments[0];
-        const extra = arguments[1] || {};
-        const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
-        const body = new URLSearchParams(form).toString();
-        return fetch(url, {method:"POST", headers, body, credentials:"include"}).then(r=>r.text());
-        """
-        txt = d.execute_script(script, fd, extra_headers) or ""
-        preview = txt[:300].replace("\n"," ")
-        if "<!DOCTYPE html" in txt[:200]:
-            print("❌ FB trả HTML (có thể chưa login / bị interstitial).")
-        print(f"[DEBUG] resp preview: {preview!r}")
-        stripped = _strip_xssi_prefix(txt)
-        objs = list(iter_json_values(stripped))
-        if not objs:
-            path = os.path.join(RAW_DUMPS_DIR, f"demo_dump_{uuid.uuid4().hex[:8]}.txt")
-            with open(path, "w", encoding="utf-8") as f: f.write(txt)
-            print(f"⚠️ Không parse được JSON. Đã dump -> {path}")
-            return None
-        return choose_best_graphql_obj(objs)
-
-    # 6) current page (cursor cũ)
-    obj1 = post_and_parse(form, req_headers)
-    if not obj1:
-        return
-    posts1 = extract_first_k_posts(obj1, k=3)   # lấy thử 3 bài đầu
-    print("\n✅ Trang tại cursor cũ — preview:")
-    for i, p in enumerate(posts1, 1):
-        print(f"#{i} id={p['id']} url={p['url']}\n{(p['text'] or '<no text>').strip()}\n")
-
-    # 7) next page
-    next_cursor = choose_best_cursor(obj1)
-    if not next_cursor:
-        print("\n⚠️ Không tìm thấy end_cursor cho trang tiếp theo.")
-        return
-    eff2 = dict(eff)
-    placed = False
-    for key in ["cursor","after","endCursor","afterCursor","feedAfterCursor"]:
-        if key in eff2:
-            eff2[key] = next_cursor; placed = True; break
-    if not placed:
-        eff2["cursor"] = next_cursor
-    form2 = dict(form)
-    form2["variables"] = json.dumps(eff2, separators=(",",":"))
-    obj2 = post_and_parse(form2, req_headers)
-    if not obj2:
-        return
-    posts2 = extract_first_k_posts(obj2, k=3)
-    print("\n➡️ Trang kế tiếp — preview:")
-    for i, p in enumerate(posts2, 1):
-        print(f"#{i} id={p['id']} url={p['url']}\n{(p['text'] or '<no text>').strip()}\n")
-    t2 = extract_first_story_text(obj2)
-    print("\n➡️ Trang kế tiếp — bài đầu tiên:")
-    print(t2 or "<không có text>")
 
 if __name__ == "__main__":
-    demo_resume_fetch_v3()
+    main()
+
+import threading
+from utils.utils import get_local_device_config
+from utils.log_utils import logger
+import schedule
+from datetime import datetime, timedelta
+from datetime import time as time_dt
+import time
+from queue import Queue
+from src.scraper_thread import ScraperThread
+from src.get_link_es import ElasticFunc
+from utils.utils import read_data_from_file
+import copy
+from configs import config as cfg
+# from multiprocessing import Manager
+import threading
+import os
+"""
+Class đọc file config, create task chạy config
+"""
+
+
+class ScarperManager:
+    process_scrapers = {}
+
+    def __init__(self) -> None:
+        self.config_device = None
+    def run(self):
+        self.config_device = get_local_device_config()
+        num_config = len(self.config_device)
+        logger.info(f"Số config có trong file là {num_config}")
+        for config in self.config_device:
+            if config['mode']['time_run_schedule'] == 0:
+                current_time = datetime.now().time()
+                target_time = time_dt(int(config['mode']['start_time_run'].split(":")[0]), int(config['mode']['start_time_run'].split(":")[1]), 0) 
+                
+                # if self.config_device[i]['mode']['is_login'] == 1:
+                #     pass # trường hợp cần login tài khoản
+                # else: #trường hợp k cần login
+                #     pass
+                
+                if current_time > target_time:
+                    check_time = True
+                else:
+                    check_time = False
+                if int(config['mode']['time_expired']) > 1 or check_time:
+                    if config['mode']['is_login'] == 1:
+                        pass # trường hợp cần login tài khoản
+                    else: #trường hợp k cần login
+                        self.parser_config_and_create_process(config)
+                schedule.every(config['mode']['time_expired']).days.at(config['mode']['start_time_run'], "Asia/Ho_Chi_Minh").do(lambda cfg=config: self.parser_config_and_create_process(cfg))
+            else:
+                # schedule.every(config['mode']['time_run_schedule']).hours.do(lambda cfg=config: self.parser_config_and_create_process(cfg))
+                # self.parser_config_and_create_process(config)
+                threading.Thread(target=self.wait_run_schedule, args=(config,)).start()
+        #self.run_job()
+        run_job_thread = threading.Thread(target=self.run_job)
+        run_job_thread.start()
+        run_job_thread.join()
+    def wait_run_schedule(self, config):
+        target_time = time_dt(int(config['mode']['start_time_run'].split(":")[0]), int(config['mode']['start_time_run'].split(":")[1]), 0) 
+                
+        while datetime.now().time() < target_time:
+            print(f"Đang đợi đến {target_time} để chạy. Hiện tại {datetime.now().time()}")
+            time.sleep(20)
+            
+        schedule.every(config['mode']['time_run_schedule']).hours.do(lambda cfg=config: self.parser_config_and_create_process(cfg))
+        self.parser_config_and_create_process(config)
+    def run_job(self):
+        all_jobs = schedule.get_jobs()
+        logger.debug(self.process_scrapers)
+        for key, val in list(self.process_scrapers.items()):
+            if not val.is_alive():
+                del self.process_scrapers[key]
+        logger.warning(f"Pendding job {all_jobs}.......")
+        schedule.run_pending()
+        threading.Timer(20, self.run_job).start()
+
+    def parser_config_and_create_process(self, config):
+        if config["mode"]["is_login"]:
+            pass
+        else:
+            if config['mode']['id'] == 2:
+                if config['mode']['is_type'] == 0:
+                    logger.info(f"Số thread là {config['mode']['num_thread']}")
+                    queue_ = Queue()
+                    
+                    #Đọc danh sách các group từ file
+                    # for _ in config['mode']['group_id']:
+                    #     queue_.put(_)
+                    
+                    groups = read_data_from_file(path_file=cfg.PATH_TO_GROUP_ID)
+                    for _ in groups: #config['mode']['group_id']:
+                        queue_.put(_)
+                    logger.info(f"Tổng số group cần crawl là {queue_.qsize()}")
+                        
+                    ########
+                    if int(config['mode']['num_thread']) > 1:
+                        config_temp = copy.deepcopy(config)
+                        for i in range(config['mode']['num_thread']):
+                            config_temp['mode']['group_id'] = []
+                            config_temp['id'] = str(config['id'])  + "_" + str(i)
+                            self.start_scraper_not_login(config=config_temp, queue_=queue_)
+                    else:
+                        self.start_scraper_not_login(config=config, queue_=queue_)
+                elif config['mode']['is_type'] == 1:
+                    logger.info(f"Số thread là {config['mode']['num_thread']}")
+                    queue_ = Queue()
+                    pages = read_data_from_file(path_file=cfg.PATH_TO_PAGE_ID)
+                    
+                    for _ in pages: #config['mode']['page_id']:
+                        queue_.put(_)
+                        
+                    logger.info(f"Tổng số page cần crawl là {queue_.qsize()}")
+                    if int(config['mode']['num_thread']) > 1:
+                        config_temp = copy.deepcopy(config)
+                        for i in range(config['mode']['num_thread']):
+                            config_temp['mode']['page_id'] = []
+                            config_temp['id'] = str(config['id'])  + "_" + str(i)
+                            self.start_scraper_not_login(config=config_temp, queue_=queue_)
+                    else:
+                        self.start_scraper_not_login(config=config, queue_=queue_)
+            elif config['mode']['id'] == 3:
+                #lấy thông tin các post
+                
+                current_time = datetime.now()
+                time_check = current_time + timedelta(hours=config['mode']['time_expired'])#self.job_n_day[group_thread].next_run#current_time + timedelta(days=(config["mode"]["range_date"][-1]-config["mode"]["range_date"][0]))
+
+                queue_ = Queue()
+                files_page = [
+                    f for f in os.listdir("db/Pages_1")
+                    if os.path.isfile(os.path.join("db/Pages_1", f))
+                ]
+                files_group = [
+                    f for f in os.listdir("db/Groups")
+                    if os.path.isfile(os.path.join("db/Groups", f))
+                ]
+                files_page_done = [
+                    f for f in os.listdir("db/Update")
+                    if os.path.isfile(os.path.join("db/Update", f))
+                ]
+                list_posts_page = []
+                list_posts_group = []
+                list_posts_page_done = []
+                for file_page in files_page:
+                    data_p = read_data_from_file(path_file=f"db/Pages_1/{file_page}")
+                    list_posts_page.extend(data_p)
+                logger.info(f"Tổng số bài viết trong file page là {len(list_posts_page)}")
+                for file_group in files_group:
+                    data_g = read_data_from_file(path_file=f"db/Groups/{file_group}")
+                    list_posts_group.extend(data_g)
+                logger.info(f"Tổng số bài viết trong file group là {len(list_posts_group)}")
+                for file_page_done in files_page_done:
+                    try:
+                        data_d = read_data_from_file(path_file=f"db/Update/{file_page_done}")
+                        list_posts_page_done.extend(data_d)
+                    except:
+                        continue
+                logger.info(f"Tổng số bài viết đã done trong file page là {len(list_posts_page_done)}")
+                list_posts = list((set(list_posts_page + list_posts_group)) - set(list_posts_page_done))
+                logger.info(f"Tổng số bài viết cần crawl là {len(list_posts)}")#lấy tất cả các bài viết trong page và group
+
+                for data in list_posts:
+                    if data.strip() == "":
+                        continue
+                    queue_.put(data.strip())
+                logger.info(f"Tổng số bài viết cần crawl là {queue_.qsize()}")
+                if queue_.qsize() == 0:
+                    logger.warning("Không có bài viết nào cần được update tong khoảng thời gian trên")
+                    return
+                config_temp = copy.deepcopy(config)
+              
+                if int(config['mode']['num_thread']) > 1:
+                    for i in range(int(config['mode']['num_thread'])):
+                        #config_temp = config
+                        id_new = str(config['id'])  + "_" + str(i)
+                        config_temp['id'] = id_new
+                        self.start_scraper_not_login(config_temp, queue_update=queue_, time_check=time_check)#, shared_dict_3=shared_dict_3, lock_3=lock_3)
+                else:
+                    self.start_scraper_not_login(config, queue_update=queue_, time_check=time_check)#, shared_dict_3=shared_dict_3, lock_3=lock_3)
+
+                
+
+    """
+    Hàm để tạo thread chạy scraper facebook theo các mode
+    """
+    def start_scraper_not_login(self, config, **kwargs):
+        sp = ScraperThread(config, **kwargs)
+        sp.daemon = True
+        sp.start()
+        time.sleep(2)
+        self.process_scrapers[str(config["id"])] = sp
+        # if config["id"] not in self.process_scrapers:
+        #     self.process_scrapers[str(config["id"])] = sp
+        # else:
+        #     logger.warning(f"Key {str(config['id'])} đã tồn tại")
+
+"""
+Lấy thông tin cơ bản của tất cả các post trong 1 page trong 1 khoảng thời gian nhất định hoặc số bài nhất định
+"""
+
+from utils.log_utils import logger
+from fb_api_wrapper.libs.fb_core import FaceApiWrapper
+from utils.common_utils import CommonUtils
+import json
+from configs.config import is_data_raw_post, SLEEP_RANDOM_GROUP
+from utils.check_utils import check_time_line_expired
+from utils.utils import read_data_from_file, write_data_to_file, write_data_raw_post, get_proxy_from_list, get_proxy, get_random_proxy
+# from utils.api_utils import get_ids_post, insert_ids_post
+from src.post import Post
+from src.parse_json_post import ParserInfoPost
+from typing import Optional, Union
+import os
+import requests
+from configs.define_api import HEADERS
+from queue import Queue
+from datetime import datetime
+from threading import Lock
+
+class ScaperPostInforPage:
+
+    """
+    Khởi tạo đối tượng ScaperPostInforPage
+    - datasets: list danh sách các page id cần lấy thông tin 
+    - PROXY: danh sách các proxy, bắt buộc phải dùng proxy khi chạy
+    - time_line: thời gian lấy bài viết
+    - MAX_SIZE_POST: số bài viết tối đa
+    - process_name: tên process
+    """
+    def __init__(
+            self, 
+            PROXY: Optional[dict] = None, 
+            PROXYS: Optional[list] = None,
+            queue_: Optional[Queue] = None,
+            datasets: Optional[list] = None,
+            MAX_SIZE_POST: Optional[int]=1000, 
+            time_line: Optional[datetime]=None, 
+            process_name: Optional[str]="", 
+            lock: Optional[Lock] = None
+        ) -> None:
+        self.queue_ = queue_
+        self.datasets = datasets
+        self.PROXY = PROXY
+        self.PROXYS = PROXYS
+        self.MAX_SIZE_POST = MAX_SIZE_POST
+        self.process_name = process_name
+        self.time_line = time_line
+        self.idem = 0
+        self.bCheck = True
+        self.iLinkDuplicate = 0
+        self.check_time_expired = False
+        self.lock = lock
+        self.page_backup = self.__load_data_backup()
+        self.SESSION = None
+        self.proxy_use = None
+        #self.tenancy_id = []
+        self.__create_session()
+
+    def __create_session(self):
+        logger.info(f"Process {self.process_name} >> Create session")
+        self.SESSION = requests.Session()
+        if self.PROXYS:
+            #self.proxy_use = get_proxy_from_list(self.PROXYS)
+            self.proxy_use = get_random_proxy(self.PROXYS)
+        else:
+            #self.proxy_use = get_proxy(self.PROXY)
+            self.proxy_use = self.PROXY
+        self.SESSION.headers.update(HEADERS)
+        if self.proxy_use:
+            self.SESSION.proxies.update(self.proxy_use)
+   
+    def __reset_params(self):
+        self.idem = 0
+        self.bCheck = True
+        self.iLinkDuplicate = 0
+        self.check_time_expired = False
+    def __processing_data(self, node_posts: Optional[list], page_id: Union[str, int], link_posts_all: Optional[list]):
+        page_id = str(page_id)
+        for _p in node_posts:
+            try:
+                post_id = _p['post_id']
+                #lấy thông tin cơ bản của bài viết
+                post = Post(id=post_id, parent_id=page_id, type="facebook page")
+                info_post = ParserInfoPost(post=post, path_file=f"db/Pages/{page_id}/{page_id}_info.json", id_topic=0)
+                info_post.extract(jsondata=_p)
+                author_id = post.author_id
+            
+                self.idem += 1
+                ## lấy thời gian bài post 
+                create_time_post = post.created_time
+                if is_data_raw_post:
+                    write_data_raw_post(path_file=f"db/Pages/{page_id}/{page_id}_{author_id}_{post_id}.txt", data=json.dumps(_p))
+                
+                logger.info(f"Process {self.process_name} >> Time create post {post_id} {create_time_post}")
+                if self.time_line is not None:
+                    if check_time_line_expired(create_time_post, self.time_line):
+                        logger.warning(f"Process {self.process_name} >> Thời gian bài đăng đã quá {self.time_line}")
+                        self.check_time_expired =  True
+                        break
+
+                #data_link ="facebook page" + "|" + page_id + "|" + author_id + "|" + post_id
+                data_link = f"facebook page|{page_id}|{post.id_encode}|{post_id}"
+                logger.info(data_link)
+                if data_link in link_posts_all:
+                    logger.info(f"Process {self.process_name} >> id post đã có trong db {data_link}")
+                    self.iLinkDuplicate += 1
+                    continue 
+                else:
+                    self.iLinkDuplicate = 0
+                    write_data_to_file(path_file=f"db/Pages/{page_id}.txt", message=str(data_link))
+                    ## Comment lại để test
+                    #insert_ids_post(ids=[str(data_link)], table_name="facebook_page", object_id=str(page_id))
+                            
+                del info_post
+                del post
+            except Exception as ex:
+                logger.warning(f"Process {self.process_name} >> Error func __processing_data: {ex}")
+    def __check_done(self):
+        if self.iLinkDuplicate >= 3:
+            logger.warning(f"Process {self.process_name} >> Tất cả bài viết trong page, page đã trùng")
+            self.bCheck = False
+        if self.check_time_expired:
+            if self.time_line:
+                logger.warning(f"Process {self.process_name} >> Tất cả bài viết trong page đã quá thời gian {self.time_line}")
+                self.bCheck = False
+        if self.idem > self.MAX_SIZE_POST and self.MAX_SIZE_POST != -1:
+            logger.warning(f"Process {self.process_name} >> Đã lấy đủ số lượng bài ưu cầu")
+            self.bCheck = False
+
+    def __scaper_page(self, page_id: Union[str, int], link_posts_all: Optional[list]):
+        try:
+            self.__reset_params()
+            
+            posts_generator = FaceApiWrapper.get_node_posts_page(page_id=page_id, session=self.SESSION, post_limit=self.MAX_SIZE_POST)
+
+            for node_posts in posts_generator:
+                self.__processing_data(node_posts=node_posts, page_id=page_id, link_posts_all=link_posts_all)
+                self.__check_done()
+                if not self.bCheck:
+                    break
+            del posts_generator
+            logger.info(f"Process {self.process_name} >> Scraper done group {page_id}, number post {self.idem}")
+                  
+            # if self.idem == 0:
+            #     with open(f"db/Groups/{group_id}_noposst.txt", "w", encoding="utf-8") as fp:
+            #         fp.write(group_id)
+        except Exception as e:
+            logger.error(f"Process {self.process_name} >> Error func scaper_group: {e}")
+
+    def __load_data_backup(self):
+        try:
+            return read_data_from_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt")
+        except:
+            return []
+        
+    def run_error_page(self):
+        try:
+            pages_id_error = list(set(read_data_from_file(path_file=f"db/Pages/page_error_{self.process_name}.txt")))
+            logger.warning(f"Process {self.process_name} >> Số page lỗi cần chạy lại là {len(pages_id_error)}")
+            for page_ in pages_id_error:
+                # try:
+                #     link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_}.txt")))
+                # except Exception as ex:
+                #     logger.warning(ex)
+                #     link_posts_all = []
+                #link_posts_all = get_ids_post(table_name="facebook_page", object_id=str(page_))
+                try:
+                    link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_}.txt")))
+                except Exception as ex:
+                    logger.warning(ex)
+                    link_posts_all = []
+                self.__scaper_page(page_, link_posts_all)
+                CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
+            try:
+                logger.info(f"Process {self.process_name} >> Remove err_file")
+                os.remove(f"db/Pages/page_error_{self.process_name}.txt")
+            except:
+                pass  
+        except Exception as ex:
+            logger.warning(ex)
+
+    def start_scraper_with_datasets(self):
+        logger.info(f"Process {self.process_name} >> Số Page có trong dataset là: {len(self.datasets)}")
+
+        for index, page_id in enumerate(self.datasets):
+            page_id = str(page_id)
+
+            if str(page_id) in self.page_backup:
+                logger.warning(f"Process {self.process_name} >> Page {page_id} đã được crawl trong job hiện tại. Next page")
+                continue
+            self.page_backup.append(str(page_id))
+            logger.info(f"Process {self.process_name} >> Scaper page {page_id}")
+            #try:
+                #link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_id}.txt")))
+                
+            # except Exception as ex:
+            #     logger.warning(ex)
+            #     link_posts_all = []
+            #link_posts_all = get_ids_post(table_name="facebook_page", object_id=str(page_id))
+            try:
+                link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_id}.txt")))
+            except Exception as ex:
+                logger.warning(ex)
+                link_posts_all = []
+            path_data = f"db/Pages/{page_id}"
+            if not os.path.exists(path_data):
+                os.makedirs(path_data)
+            self.__scaper_page(page_id, link_posts_all)
+            write_data_to_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt", message=str(page_id))
+            CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
+        try:
+            logger.info(f"Process {self.process_name} >> Remove backup_file")
+            os.remove(f"db/Pages/backup_page_{self.process_name}.txt")
+        except:
+            pass  
+        self.run_error_page()
+    def start_scraper_with_queue(self):
+        while not self.queue_.empty():
+            try:
+                logger.info(f"Process {self.process_name} >> Size of queue {self.queue_.qsize()}")
+
+                page_id = self.queue_.get()
+                # page_id = data['id']
+                # self.tenancy_id = data['tenancy_id']
+                if str(page_id) in self.page_backup:
+                    logger.warning(f"Process {self.process_name} >> Page {page_id} đã được crawl trong job hiện tại. Next page")
+                    continue
+                self.page_backup.append(str(page_id))
+                logger.info(f"Process {self.process_name} >> Scaper page {page_id}")
+                link_posts_all = [] #get_ids_post(table_name="facebook_page", object_id=str(page_id))
+                path_data = f"db/Pages/{page_id}"
+                if not os.path.exists(path_data):
+                    os.makedirs(path_data)
+                self.__scaper_page(page_id, link_posts_all)
+                write_data_to_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt", message=str(page_id))
+                CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
+                try:
+                    logger.info(f"Process {self.process_name} >> Remove backup_file")
+                    os.remove(f"db/Pages/backup_page_{self.process_name}.txt")
+                except:
+                    pass  
+                self.run_error_page()
+
+            except Exception as ex:
+                logger.error(f"Process {self.process_name} >> Error func start_with_queue {ex}")
+    def start_scraper(self):
+        # if self.proxy_use is None:
+        #     logger.critical(f"Process {self.process_name} >> Tool cần proxy để chạy...")
+        #     return
+        logger.info(f"Process {self.process_name} >> Start scraper with proxy {self.proxy_use}")
+        if self.datasets:
+            self.start_scraper_with_datasets()
+        elif self.queue_:
+            self.start_scraper_with_queue()
+        else:
+            logger.warning(f"Process {self.process_name} >> Không có data update")
+# hiện tại code trên đang sử dụng thư viện fb_api_wrapper để crawler dữ liệu bài viết mà đang không có checkpoint bằng cursor, tôi muốn 
