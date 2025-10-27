@@ -2,36 +2,34 @@
 """
 Facebook Group GraphQL crawler — Class-based (resume-first)
 - Không dùng profile thật; nạp cookies + localStorage trước khi crawl
+- Route toàn bộ traffic qua proxy (--proxy-server)
 - Ưu tiên: dump response JSON của từng request GraphQL ra file riêng (raw + clean)
 - Resume-first bằng cursor trong checkpoint
 
 ⚠️ Chỉ crawl nơi bạn có quyền. Tôn trọng ToS.
 """
 
-import os, re, json, time, random, socket, subprocess, urllib.parse, datetime
-import shutil, tempfile
-from typing import Any, Dict, List, Optional, Tuple
+import os, re, json, time, random, urllib.parse, datetime, shutil, tempfile
+from typing import Any, Dict, List, Optional
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-# ===== Bạn có thể giữ utils/configs cũ nếu muốn =====
 from utils import (
     _strip_xssi_prefix, iter_json_values, choose_best_graphql_obj,
-    collect_post_summaries, filter_only_group_posts)
+    collect_post_summaries, filter_only_group_posts
+)
 
-# === Nếu bạn đã có configs.py, thêm 2 biến COOKIES_PATH, LOCALSTORAGE_PATH trong đó
-#     Còn không, block dưới sẽ tự fallback giá trị mặc định.
 try:
     from configs import (
         CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, REMOTE_PORT,
         GROUP_URL, KEEP_LAST, OUT_NDJSON, RAW_DUMPS_DIR, CHECKPOINT,
-        ENABLE_PARSE, CURSOR_KEYS, COOKIES_PATH, LOCALSTORAGE_PATH, FB_ORIGINS
+        ENABLE_PARSE, CURSOR_KEYS, COOKIES_PATH, LOCALSTORAGE_PATH, FB_ORIGINS,
+        PROXY_URL,  # <-- thêm key này trong configs nếu thích (hoặc truyền ở __main__)
     )
 except Exception:
-    # ---- fallback nhanh nếu bạn không import configs ----
     CHROME_PATH = r""
-    USER_DATA_DIR = r""      # nên trỏ thư mục TRỐNG, không phải profile thật
+    USER_DATA_DIR = r""
     PROFILE_NAME  = ""
     REMOTE_PORT   = 9222
     GROUP_URL     = "https://www.facebook.com/groups/<your-group-id-or-slug>"
@@ -41,8 +39,14 @@ except Exception:
     CHECKPOINT    = "checkpoint.json"
     ENABLE_PARSE  = False
     CURSOR_KEYS   = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
-    COOKIES_PATH      = "./cookies.json"        # <-- file bạn vừa export
-    LOCALSTORAGE_PATH = "./localstorage.json"   # <-- file bạn vừa export
+    COOKIES_PATH      = "./cookies.json"
+    LOCALSTORAGE_PATH = "./localstorage.json"
+    FB_ORIGINS = [
+        "https://www.facebook.com",
+        "https://web.facebook.com",
+        "https://m.facebook.com",
+    ]
+    PROXY_URL = None  # đặt chuỗi "http://123.45.67.89:8080" tại đây nếu muốn
 
 os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
 
@@ -52,20 +56,18 @@ class GroupGraphQLCrawler:
                  group_url: str = GROUP_URL,
                  chrome_path: str = CHROME_PATH,
                  user_data_dir: str = USER_DATA_DIR,
-                 profile_name: str = PROFILE_NAME,
-                 remote_port: int = REMOTE_PORT,
                  raw_dir: str = RAW_DUMPS_DIR,
                  checkpoint_path: str = CHECKPOINT,
                  out_ndjson: str = OUT_NDJSON,
                  keep_last: int = KEEP_LAST,
-                 headless: bool = True,  # <-- mặc định KHÔNG headless để bạn kiểm tra login
+                 headless: bool = False,
                  cookies_path: Optional[str] = COOKIES_PATH,
-                 localstorage_path: Optional[str] = LOCALSTORAGE_PATH):
+                 localstorage_path: Optional[str] = LOCALSTORAGE_PATH,
+                 proxy_url: Optional[str] = PROXY_URL  # <-- NEW
+                 ):
         self.group_url = group_url
         self.chrome_path = chrome_path
         self.user_data_dir = user_data_dir
-        self.profile_name = profile_name
-        self.remote_port = remote_port
         self.raw_dir = raw_dir
         self.checkpoint_path = checkpoint_path
         self.out_ndjson = out_ndjson
@@ -73,6 +75,7 @@ class GroupGraphQLCrawler:
         self.headless = headless
         self.cookies_path = cookies_path
         self.localstorage_path = localstorage_path
+        self.proxy_url = proxy_url
 
         self.driver: Optional[webdriver.Chrome] = None
         self.friendly: Optional[str] = None
@@ -82,45 +85,47 @@ class GroupGraphQLCrawler:
         self.cursor: Optional[str] = None
 
     # ---------- Boot ----------
-    def _wait_port(self, host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
-        end = time.time() + timeout
-        while time.time() < end:
-            try:
-                with socket.create_connection((host, port), timeout=1):
-                    return True
-            except Exception:
-                time.sleep(poll)
-        return False
-
     def start_driver(self) -> webdriver.Chrome:
         options = Options()
 
-        # Optional: nếu bạn biết rõ chrome_path
+        # Optional: chỉ định binary nếu cần
         if self.chrome_path:
             options.binary_location = self.chrome_path
         else:
-            # Thử tự tìm binary; nếu không thấy, Selenium Manager vẫn tự handle
             for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
-                if shutil.which(cand):
-                    options.binary_location = shutil.which(cand)
+                p = shutil.which(cand)
+                if p:
+                    options.binary_location = p
                     break
 
-        # Linux flags
+        # Flags thân thiện Linux/CI
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1400,920")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-features=IsolateOrigins,site-per-process")
 
-        # Headless hay không tuỳ bạn
-        if self.headless:
-            options.add_argument("--headless=new")
-
-        # user-data-dir: nếu trống, tạo tạm để ngăn Chrome đè vào profile mặc định
+        # ⚠️ KHÔNG dùng profile thật để tránh lock
         if not self.user_data_dir:
             self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
         options.add_argument(f"--user-data-dir={self.user_data_dir}")
 
-        # KHÔNG cần remote debugging port / subprocess
+        # Proxy (HTTP/SOCKS đều được; ví dụ: http://123.45.67.89:8080)
+        if self.proxy_url:
+            options.add_argument(f"--proxy-server={self.proxy_url}")
+            # bypass các host nội bộ (tuỳ môi trường)
+            options.add_argument("--proxy-bypass-list=<-loopback>")
+
+        if self.headless:
+            options.add_argument("--headless=new")
+
         self.driver = webdriver.Chrome(options=options)
+
+        # Log nhẹ để bạn biết proxy đang on
+        if self.proxy_url:
+            print(f"[PROXY] Using proxy server: {self.proxy_url}")
+        print(f"[PROFILE] Ephemeral user-data-dir: {self.user_data_dir}")
+
         return self.driver
 
     # ---------- Hook ----------
@@ -405,16 +410,12 @@ class GroupGraphQLCrawler:
             return bool(res.get("success"))
         except Exception:
             return False
+
     def _cdp_set_cookie_for_url(self, cookie: Dict[str, Any], url: str) -> bool:
-        """
-        Tạo cookie host-only cho 1 origin cụ thể bằng cách truyền 'url' (KHÔNG truyền domain).
-        Điều này giúp đảm bảo cookie gắn chặt vào www/web/m host.
-        """
         assert self.driver is not None
         self.driver.execute_cdp_cmd("Network.enable", {})
         name  = cookie.get("name") or cookie.get("Name")
         value = cookie.get("value") or cookie.get("Value")
-
         path      = cookie.get("path") or cookie.get("Path") or "/"
         secure    = bool(cookie.get("secure") or cookie.get("Secure") or False)
         httpOnly  = bool(cookie.get("httpOnly") or cookie.get("HttpOnly") or False)
@@ -422,7 +423,6 @@ class GroupGraphQLCrawler:
         if isinstance(same_site, str):
             s = same_site.capitalize()
             same_site = s if s in ("Lax", "Strict", "None") else None
-
         expires = cookie.get("expires") or cookie.get("expiry") or cookie.get("expirationDate")
         if isinstance(expires, str):
             try: expires = float(expires)
@@ -432,13 +432,11 @@ class GroupGraphQLCrawler:
 
         params = {
             "name": name, "value": value,
-            "url": url,                 # <— host-only theo origin
-            "path": path,
+            "url": url, "path": path,
             "secure": secure, "httpOnly": httpOnly
         }
         if same_site: params["sameSite"] = same_site
         if isinstance(expires, (int, float)): params["expires"] = expires
-
         try:
             res = self.driver.execute_cdp_cmd("Network.setCookie", params)
             return bool(res.get("success"))
@@ -448,7 +446,7 @@ class GroupGraphQLCrawler:
     def bootstrap_auth(self):
         assert self.driver is not None
 
-        # 1) Load cookies từ file
+        # 1) Load cookies
         cookies_data = self._load_json_file(self.cookies_path)
         if isinstance(cookies_data, dict) and "cookies" in cookies_data:
             cookies_list = cookies_data["cookies"]
@@ -457,14 +455,12 @@ class GroupGraphQLCrawler:
         else:
             cookies_list = []
 
-        # 1a) Set theo domain (nếu có) — cho đủ bộ
         ok_domain = 0
         for c in cookies_list:
             if self._cdp_set_cookie(c):
                 ok_domain += 1
         print(f"[AUTH] Domain-scoped cookies: {ok_domain}/{len(cookies_list)}")
 
-        # 1b) Mirror host-only cho từng origin www/web/m — đặc biệt quan trọng cho c_user/xs/fr
         ok_host = 0
         for origin in FB_ORIGINS:
             for c in cookies_list:
@@ -472,11 +468,10 @@ class GroupGraphQLCrawler:
                     ok_host += 1
         print(f"[AUTH] Host-only mirrors set: {ok_host} (over {len(cookies_list)*len(FB_ORIGINS)} attempts)")
 
-        # 2) Inject localStorage sau khi vào www
+        # 2) localStorage
         ls_dict = self._load_json_file(self.localstorage_path)
         self.driver.get("https://www.facebook.com/")
         time.sleep(1.2)
-
         if isinstance(ls_dict, dict) and ls_dict:
             self.driver.execute_script("window.localStorage.clear();")
             script = """
@@ -491,18 +486,16 @@ class GroupGraphQLCrawler:
             self.driver.refresh()
             time.sleep(1.0)
 
-        # 3) Verify theo từng origin: mở URL, check cookie ở document & qua CDP
+        # 3) Verify theo từng origin
         self.driver.execute_cdp_cmd("Network.enable", {})
         for origin in FB_ORIGINS:
             self.driver.get(origin + "/")
             time.sleep(0.8)
             has_cuser = self.driver.execute_script("return document.cookie.includes('c_user');")
-            # đọc cookies gửi cho URL này
             got = self.driver.execute_cdp_cmd("Network.getCookies", {"urls": [origin + "/"]})
             names = sorted([c.get("name","") for c in (got.get("cookies") or [])])
             print(f"[VERIFY] {origin} | document.has(c_user)={has_cuser} | cookies={names}")
 
-        # 4) In location cuối
         href = self.driver.execute_script("return location.href;")
         print(f"[AUTH] Final URL: {href}")
 
@@ -580,10 +573,10 @@ class GroupGraphQLCrawler:
     def run(self):
         d = self.start_driver()
 
-        # 0) NẠP COOKIES + LOCALSTORAGE (không headless để bạn nhìn)
+        # 0) NẠP COOKIES + LOCALSTORAGE
         self.bootstrap_auth()
 
-        # 1) Cài hook
+        # 1) Hook GraphQL
         self.install_early_hook()
 
         # 2) Vào group
@@ -596,7 +589,7 @@ class GroupGraphQLCrawler:
         nxt = self.wait_next_req(d, 0, self.is_group_feed_req, timeout=25, poll=0.25)
         if not nxt:
             raise RuntimeError("Không bắt được request feed của group. Hãy cuộn thêm / kiểm tra quyền vào group.")
-        idx, first_req = nxt
+        _, first_req = nxt
 
         form = self.parse_form(first_req.get("body", ""))
         self.friendly = urllib.parse.parse_qs(first_req.get("body", "")).get("fb_api_req_friendly_name", [""])[0]
@@ -607,7 +600,6 @@ class GroupGraphQLCrawler:
         raw0 = first_req.get("responseText") or ""
         self.dump_graphql_text(raw0, tag="page1", page_idx=1, seq=0)
 
-        # state
         state = self.load_checkpoint()
         self.seen_ids = self.normalize_seen_ids(state.get("seen_ids", []))
         self.cursor = state.get("cursor")
@@ -640,7 +632,7 @@ class GroupGraphQLCrawler:
                 self.cursor = end_cursor
 
             print(f"[DEBUG] page1 posts={(len(page_posts) if ENABLE_PARSE else '—dump-only—')} | cursors={len(cursors)} | has_next={has_next} | pick={str(end_cursor)[:24] if end_cursor else None}")
-            print(f"[DEBUG] doc_id={form.get('doc_id')} | friendly={self.friendly}")
+            print(f"[DEBUG] doc_id={self.last_doc_id} | friendly={self.friendly}")
 
             if ENABLE_PARSE:
                 fresh = [p for p in page_posts if p.get("rid") and p["rid"] not in self.seen_ids]
@@ -652,7 +644,7 @@ class GroupGraphQLCrawler:
             else:
                 print(f"[PAGE#1] dump-only mode. next={bool(has_next)}")
 
-            self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=form.get('doc_id'),
+            self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=self.last_doc_id,
                                  last_query_name=self.friendly, vars_template=template_now)
             page = 1
 
@@ -700,18 +692,18 @@ class GroupGraphQLCrawler:
 
             print(f"[PAGE#{page}] {(f'got {len(page_posts)} (new {len(fresh)}), ' if ENABLE_PARSE else '')}total={total_written}, next={bool(has_next)} | cursor={str(self.cursor)[:24] if self.cursor else None}")
 
-            self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=form.get('doc_id'),
+            self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=self.last_doc_id,
                                  last_query_name=self.friendly, vars_template=effective_template)
 
             MAX_NO_NEXT_ROUNDS = 3
             if not has_next and no_progress_rounds >= MAX_NO_NEXT_ROUNDS:
                 print(f"[PAGE#{page}] next=False x{no_progress_rounds} → soft-refetch doc_id/variables (no UI)")
-                self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=form.get('doc_id'),
+                self.save_checkpoint(self.cursor, self.seen_ids, last_doc_id=self.last_doc_id,
                                      last_query_name=self.friendly, vars_template=effective_template)
 
                 refetch_ok = False
                 for attempt in range(1, 3):
-                    new_form, boot_cursor, boot_has_next, boot_obj = self.soft_refetch_form_and_cursor(d, form, effective_template)
+                    new_form, boot_cursor, boot_has_next, _ = self.soft_refetch_form_and_cursor(d, form, effective_template)
                     if new_form and (boot_cursor or boot_has_next):
                         form = new_form
                         if boot_cursor: self.cursor = boot_cursor
@@ -736,15 +728,14 @@ if __name__ == "__main__":
     crawler = GroupGraphQLCrawler(
         group_url=GROUP_URL,
         chrome_path=CHROME_PATH,
-        user_data_dir=USER_DATA_DIR,   # Nên là THƯ MỤC TRỐNG (không phải profile thật)
-        profile_name="Default",
-        remote_port=REMOTE_PORT,
+        user_data_dir="",                 # để rỗng -> dùng profile ephemeral (tránh lock)
         raw_dir=RAW_DUMPS_DIR,
         checkpoint_path=CHECKPOINT,
         out_ndjson=OUT_NDJSON,
         keep_last=KEEP_LAST,
-        headless=False,               # để bạn xem đã login hay chưa
+        headless=False,                   # bật UI để check login
         cookies_path=COOKIES_PATH,
         localstorage_path=LOCALSTORAGE_PATH,
+        proxy_url="http://123.45.67.89:8080",   # <-- proxy của bạn
     )
     crawler.run()
