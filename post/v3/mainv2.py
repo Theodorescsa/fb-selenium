@@ -47,7 +47,30 @@ except Exception:
 
 os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
 
+def _build_options(binary_path: str | None,
+                user_data_dir: str,
+                headless: bool) -> Options:
+    opts = Options()
+    # binary (optional)
+    if binary_path:
+        opts.binary_location = binary_path
+    else:
+        for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+            p = shutil.which(cand)
+            if p:
+                opts.binary_location = p
+                break
+    # linux-friendly flags
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1400,920")
+    if headless:
+        opts.add_argument("--headless=new")
 
+    # IMPORTANT: add exactly ONE user-data-dir per build
+    opts.add_argument(f"--user-data-dir={user_data_dir}")
+    # KHÔNG dùng --profile-directory trên Linux
+    return opts
 class GroupGraphQLCrawler:
     def __init__(self,
                  group_url: str = GROUP_URL,
@@ -93,31 +116,6 @@ class GroupGraphQLCrawler:
                 time.sleep(poll)
         return False
 
-    def _build_options(binary_path: str | None,
-                    user_data_dir: str,
-                    headless: bool) -> Options:
-        opts = Options()
-        # binary (optional)
-        if binary_path:
-            opts.binary_location = binary_path
-        else:
-            for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
-                p = shutil.which(cand)
-                if p:
-                    opts.binary_location = p
-                    break
-        # linux-friendly flags
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1400,920")
-        if headless:
-            opts.add_argument("--headless=new")
-
-        # IMPORTANT: add exactly ONE user-data-dir per build
-        opts.add_argument(f"--user-data-dir={user_data_dir}")
-        # KHÔNG dùng --profile-directory trên Linux
-        return opts
-
     def start_driver(self) -> webdriver.Chrome:
         attempts = 0
         last_err = None
@@ -132,7 +130,7 @@ class GroupGraphQLCrawler:
             else:
                 os.makedirs(self.user_data_dir, exist_ok=True)
 
-            options = self._build_options(
+            options = _build_options(
                 binary_path=self.chrome_path if getattr(self, "chrome_path", None) else None,
                 user_data_dir=self.user_data_dir,
                 headless=self.headless
