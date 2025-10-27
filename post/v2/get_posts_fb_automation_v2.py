@@ -447,11 +447,201 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
         for v in obj:
             collect_post_summaries(v, out, group_url)
 
+def _pick_text(a, b):
+    """Ưu tiên b nếu b 'tốt hơn' (không None, dài hơn)."""
+    if not b: 
+        return a
+    if not a:
+        return b
+    # ưu tiên chuỗi dài hơn (nhiều nội dung hơn)
+    return b if isinstance(b, str) and isinstance(a, str) and len(b) > len(a) else (b or a)
+
+def _pick_non_empty(a, b):
+    """Ưu tiên b nếu b không rỗng/None."""
+    return b if b not in (None, "", [], {}) else a
+
+def _merge_arrays(a, b):
+    out = []
+    seen = set()
+    for arr in (a or [], b or []):
+        for x in arr:
+            if x not in seen:
+                out.append(x); seen.add(x)
+    return out
+
+def _merge_counts(a, b, keys):
+    out = dict(a or {})
+    for k in keys:
+        out[k] = max((a or {}).get(k, 0), (b or {}).get(k, 0))
+    return out
+
+def _prefer_type(t1, t2):
+    """Ưu tiên type cụ thể hơn: page/profile/group > story."""
+    rank = {"facebook page": 3, "facebook profile": 3, "facebook group": 3, "story": 1, None: 0}
+    return t2 if rank.get(t2,0) >= rank.get(t1,0) else t1
+
+COUNT_KEYS = ["like","comment","haha","wow","sad","love","angry","care","share"]
+
+def merge_two_posts(a: dict, b: dict) -> dict:
+    if not a: return b or {}
+    if not b: return a or {}
+    m = dict(a)
+
+    # id/rid: giữ nguyên
+    m["id"]  = m.get("id")  or b.get("id")
+    m["rid"] = m.get("rid") or b.get("rid")
+
+    # type cụ thể hơn
+    m["type"] = _prefer_type(m.get("type"), b.get("type"))
+
+    # link/author fields: lấy cái có giá trị
+    m["link"]        = _pick_non_empty(m.get("link"),        b.get("link"))
+    m["author_id"]   = _pick_non_empty(m.get("author_id"),   b.get("author_id"))
+    m["author"]      = _pick_non_empty(m.get("author"),      b.get("author"))
+    m["author_link"] = _pick_non_empty(m.get("author_link"), b.get("author_link"))
+    m["avatar"]      = _pick_non_empty(m.get("avatar"),      b.get("avatar"))
+
+    # created_time: ưu tiên số lớn hơn (mới hơn)
+    ct_a, ct_b = m.get("created_time"), b.get("created_time")
+    try:
+        m["created_time"] = max(int(ct_a) if ct_a is not None else 0, int(ct_b) if ct_b is not None else 0) or (ct_a or ct_b)
+    except:
+        m["created_time"] = ct_a or ct_b
+
+    # content: ưu tiên nội dung dài hơn/đầy đủ hơn
+    m["content"] = _pick_text(m.get("content"), b.get("content"))
+
+    # media: union
+    m["image_url"] = _merge_arrays(m.get("image_url"), b.get("image_url"))
+    m["video"]     = _merge_arrays(m.get("video"),     b.get("video"))
+
+    # hashtag: union + đã lowercase sẵn
+    m["hashtag"] = _merge_arrays(m.get("hashtag"), b.get("hashtag"))
+
+    # counts: lấy max
+    counts_a = {k: m.get(k, 0) for k in COUNT_KEYS}
+    counts_b = {k: b.get(k, 0) for k in COUNT_KEYS}
+    counts   = _merge_counts(counts_a, counts_b, COUNT_KEYS)
+    m.update(counts)
+
+    # source_id: ưu tiên cái có giá trị
+    m["source_id"] = _pick_non_empty(m.get("source_id"), b.get("source_id"))
+
+    # share flags
+    m["is_share"]   = bool(m.get("is_share")) or bool(b.get("is_share"))
+    m["link_share"] = _pick_non_empty(m.get("link_share"), b.get("link_share"))
+    m["type_share"] = _pick_non_empty(m.get("type_share"), b.get("type_share"))
+
+    return m
+from urllib.parse import urlparse, parse_qs, urlunparse
+
+def _norm_link(u: str) -> str | None:
+    """Chuẩn hóa link để so trùng: bỏ query/fragment, chuẩn host, lower path, bỏ trailing slash."""
+    if not u or not isinstance(u, str): 
+        return None
+    try:
+        p = urlparse(u)
+        # chuẩn host: web.facebook.com / m.facebook.com / www.facebook.com -> facebook.com
+        host = p.netloc.lower()
+        if host.endswith("facebook.com"):
+            host = "facebook.com"
+        # bỏ query/fragment
+        path = (p.path or "").rstrip("/")
+        return urlunparse(("https", host, path.lower(), "", "", ""))
+    except Exception:
+        return u
+
+def _extract_digits_from_fb_link(u: str) -> str | None:
+    """Lấy chuỗi số trong link post (permalink/posts/reel/...) nếu có."""
+    if not u: return None
+    try:
+        path = urlparse(u).path.lower()
+    except:
+        path = u.lower()
+    # /reel/<digits>, /posts/<digits>, /permalink/<digits>
+    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
+    return m.group(1) if m else None
+
+def _best_primary_key(it: dict) -> str | None:
+    """
+    Primary key để dedupe seen_ids:
+    - Ưu tiên rid nếu có & là dạng Uzpf... hoặc digits
+    - Nếu không, dùng id
+    - Nếu không, dùng digits từ link
+    - Nếu vẫn không, dùng normalized link
+    """
+    rid = it.get("rid")
+    _id = it.get("id")
+    link = it.get("link")
+    norm = _norm_link(link) if link else None
+    digits = _extract_digits_from_fb_link(link) if link else None
+
+    for k in (rid, _id, digits, norm):
+        if isinstance(k, str) and k.strip():
+            return k.strip()
+    return None
+
+def _all_join_keys(it: dict) -> list[str]:
+    """Tập khóa để GỘP: rid, id, digits từ link, normalized link."""
+    keys = []
+    rid = it.get("rid")
+    _id = it.get("id")
+    link = it.get("link")
+
+    if isinstance(rid, str) and rid.strip(): keys.append(rid.strip())
+    if isinstance(_id,  str) and _id.strip(): keys.append(_id.strip())
+
+    d = _extract_digits_from_fb_link(link) if link else None
+    if d: keys.append(d)
+
+    norm = _norm_link(link) if link else None
+    if norm: keys.append(norm)
+
+    # unique, giữ thứ tự
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            out.append(k); seen.add(k)
+    return out
+
+def coalesce_posts(items: list[dict]) -> list[dict]:
+    """
+    Gộp các record cùng post theo TẬP KHÓA {rid, id, digits(link), normalized_link}.
+    Nếu bất kỳ khóa nào trùng → merge cùng 1 group.
+    """
+    groups: dict[str, dict] = {}      # representative by group_id
+    key2group: dict[str, str] = {}    # map mỗi key -> group_id
+    seq = 0
+
+    def _new_group_id() -> str:
+        nonlocal seq
+        seq += 1
+        return f"g{seq}"
+
+    for it in items or []:
+        keys = _all_join_keys(it)
+        # tìm group hiện có nếu bất kỳ key nào đã thấy
+        gid = None
+        for k in keys:
+            if k in key2group:
+                gid = key2group[k]; break
+        if gid is None:
+            gid = _new_group_id()
+            groups[gid] = it
+        else:
+            groups[gid] = merge_two_posts(groups[gid], it)
+
+        # cập nhật map cho TẤT CẢ keys của nhóm sau khi merge
+        merged_keys = _all_join_keys(groups[gid])
+        for k in merged_keys:
+            key2group[k] = gid
+
+    return list(groups.values())
 
 def filter_only_group_posts(items):
     keep = []
     for it in items:
-        url = (it.get("url") or "").strip()
+        url = (it.get("link") or "").strip()  # ĐỔI: dùng 'link' thay vì 'url'
         fb_id = (it.get("id") or "").strip()
         if POST_URL_RE.match(url) or (isinstance(fb_id, str) and fb_id.startswith("Uzpf")) or it.get("post_id"):
             keep.append(it)
@@ -519,6 +709,47 @@ def update_vars_for_next_cursor(form: dict, next_cursor: str, vars_template: dic
         base["count"] = max(base["count"], 10)
     form["variables"] = json.dumps(base, separators=(",", ":"))
     return form
+def try_refetch_reel_ufi(driver, base_form: dict, video_id: str, timeout=8.0):
+    """
+    Dùng js_fetch_in_page để 'nhá' UFI cho video (reel) theo video_id.
+    Không hardcode doc_id; rely vào app preloaded ops.
+    Trả về dict counts hoặc {} nếu fail.
+    """
+    if not video_id: 
+        return {}
+
+    # 1) Tạo payload giống form hiện tại nhưng variables chỉ chứa feedback target
+    vars_min = {"feedbackTargetID": video_id, "scale": 1}
+    form2 = dict(base_form)
+    form2["variables"] = json.dumps(vars_min, separators=(",", ":"))
+
+    # 2) Gọi 1 phát để app khởi động UFI resolver (nhiều bản GraphQL sẽ tự bind)
+    _ = js_fetch_in_page(driver, form2, extra_headers={})
+
+    # 3) Chờ trong buffer __gqlReqs tìm response có UFI (top_reactions/reaction_count)
+    start_idx = max(0, gql_count(driver) - 50)
+    def _ufi_req(rec):
+        if "/api/graphql/" not in (rec.get("url") or ""): return False
+        body = rec.get("body") or ""
+        # heuristics: có video_id + fields UFI
+        if video_id not in body:
+            return False
+        txt = rec.get("responseText") or ""
+        return ("top_reactions" in txt) or ("reaction_count" in txt) or ("total_comment_count" in txt)
+
+    hit = wait_next_req(driver, start_idx, _ufi_req, timeout=timeout, poll=0.25)
+    if not hit:
+        return {}
+
+    _, req = hit
+    txt = req.get("responseText") or ""
+    obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+    if not obj:
+        return {}
+
+    # 4) Dò counts từ obj này (tái dùng parser)
+    counts = extract_reactions_and_counts(obj)
+    return counts or {}
 
 # =========================
 # Checkpoint / Output
@@ -629,6 +860,7 @@ if __name__ == "__main__":
         page_posts = []
         collect_post_summaries(obj0, page_posts)
         page_posts = filter_only_group_posts(page_posts)
+        page_posts = coalesce_posts(page_posts)  # ✅ gộp đa-khóa
 
         cursors = deep_collect_cursors(obj0)
         has_next = deep_find_has_next(obj0)
@@ -642,12 +874,21 @@ if __name__ == "__main__":
         print(f"[DEBUG] page1 posts={len(page_posts)} | cursors={len(cursors)} | has_next={has_next} | pick={str(end_cursor)[:24] if end_cursor else None}")
         print(f"[DEBUG] doc_id={form.get('doc_id')} | friendly={friendly}")
 
-        fresh = [p for p in page_posts if p.get("rid") and p["rid"] not in seen_ids]
-        append_ndjson(fresh)
-        for p in fresh:
-            if p.get("rid"):
-                seen_ids.add(p["rid"])
-        total_written += len(fresh)
+        # ✅ SAU KHI GỘP: lọc fresh theo primary key (không phụ thuộc rid)
+        fresh = []
+        for p in page_posts:
+            pk = _best_primary_key(p)
+            if pk and pk not in seen_ids:
+                fresh.append(p)
+
+        if fresh:
+            append_ndjson(fresh)
+            # ✅ thêm TẤT CẢ join-keys vào seen_ids để khóa mọi biến thể
+            for p in fresh:
+                for k in _all_join_keys(p):
+                    seen_ids.add(k)
+            total_written += len(fresh)
+
         print(f"[PAGE#1] got {len(page_posts)} (new {len(fresh)}), next={bool(has_next)}")
 
         save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=template_now)
@@ -665,6 +906,9 @@ if __name__ == "__main__":
 
         txt = js_fetch_in_page(d, form, extra_headers={})
         obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+
+        with open(os.path.join(RAW_DUMPS_DIR, f"page{page}_obj.json"), "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
         if not obj:
             open(os.path.join(RAW_DUMPS_DIR, f"page{page}_raw.txt"), "w", encoding="utf-8").write(txt)
             print(f"[PAGE#{page}] parse fail → dumped raw, break.")
@@ -673,6 +917,7 @@ if __name__ == "__main__":
         page_posts = []
         collect_post_summaries(obj, page_posts)
         page_posts = filter_only_group_posts(page_posts)
+        page_posts = coalesce_posts(page_posts)  # ✅ gộp trước
 
         cursors = deep_collect_cursors(obj)
         has_next = deep_find_has_next(obj)
@@ -683,18 +928,34 @@ if __name__ == "__main__":
         if new_cursor:
             cursor = new_cursor
 
-        fresh = [p for p in page_posts if p.get("rid") and p["rid"] not in seen_ids]
-        if fresh:
-            append_ndjson(fresh)
-            for p in fresh:
-                if p.get("rid"):
-                    seen_ids.add(p["rid"])
-            total_written += len(fresh)
+        # ✅ fresh theo primary key (pk), không chỉ rid
+        fresh = []
+        for p in page_posts:
+            pk = _best_primary_key(p)
+            if pk and pk not in seen_ids:
+                fresh.append(p)
+
+        # ✅ DEDUP trong vòng hiện tại theo pk
+        written_this_round = set()
+        fresh_dedup = []
+        for p in fresh:
+            pk = _best_primary_key(p)
+            if pk and pk not in written_this_round:
+                fresh_dedup.append(p)
+                written_this_round.add(pk)
+
+        if fresh_dedup:
+            append_ndjson(fresh_dedup)
+            # ✅ seen_ids: add toàn bộ join-keys
+            for p in fresh_dedup:
+                for k in _all_join_keys(p):
+                    seen_ids.add(k)
+            total_written += len(fresh_dedup)
             no_progress_rounds = 0
         else:
             no_progress_rounds += 1
 
-        print(f"[PAGE#{page}] got {len(page_posts)} (new {len(fresh)}), total={total_written}, next={bool(has_next)} | cursor={str(cursor)[:24] if cursor else None}")
+        print(f"[PAGE#{page}] got {len(page_posts)} (new {len(fresh_dedup)}), total={total_written}, next={bool(has_next)} | cursor={str(cursor)[:24] if cursor else None}")
 
         save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=effective_template)
 
@@ -724,9 +985,12 @@ if __name__ == "__main__":
 
             if not refetch_ok:
                 print(f"[PAGE#{page}] soft-refetch failed → stop pagination.")
-                break  # hoặc: quay về cơ chế reload UI của bạn thay vì break
+                break  # hoặc: quay về cơ chế reload UI thay vì break
 
         time.sleep(random.uniform(0.7, 1.5))
+
+    # ✅ DỌN FILE: hợp nhất theo tập khóa (rid/id/digits/link) để chắc chắn không còn fragment cũ
+    # consolidate_ndjson_inplace(OUT_NDJSON)
 
     print(f"[DONE] wrote {total_written} posts → {OUT_NDJSON}")
     print(f"[INFO] resume later with checkpoint: {CHECKPOINT}")
