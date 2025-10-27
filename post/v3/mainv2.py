@@ -93,68 +93,66 @@ class GroupGraphQLCrawler:
                 time.sleep(poll)
         return False
 
-    def start_driver(self) -> webdriver.Chrome:
-        options = Options()
-
-        # Nếu bạn muốn ép binary, gán self.chrome_path; nếu không cứ để Selenium Manager lo
-        if self.chrome_path:
-            options.binary_location = self.chrome_path
+    def _build_options(binary_path: str | None,
+                    user_data_dir: str,
+                    headless: bool) -> Options:
+        opts = Options()
+        # binary (optional)
+        if binary_path:
+            opts.binary_location = binary_path
         else:
-            # optional: thử tìm nhanh binary trên Linux
             for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
                 p = shutil.which(cand)
                 if p:
-                    options.binary_location = p
+                    opts.binary_location = p
                     break
+        # linux-friendly flags
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--window-size=1400,920")
+        if headless:
+            opts.add_argument("--headless=new")
 
-        # Flags thân thiện Linux
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--window-size=1400,920")
-        if self.headless:
-            options.add_argument("--headless=new")
-
+        # IMPORTANT: add exactly ONE user-data-dir per build
+        opts.add_argument(f"--user-data-dir={user_data_dir}")
         # KHÔNG dùng --profile-directory trên Linux
-        # Dùng user-data-dir TRỐNG, và tạo mới mỗi lần chạy
+        return opts
+
+    def start_driver(self) -> webdriver.Chrome:
         attempts = 0
         last_err = None
+
         while attempts < 3:
             attempts += 1
-            # nếu user_data_dir chưa có -> tạo tạm; nếu có nhưng bị "in use" -> cũng tạo tạm
+
+            # nếu self.user_data_dir rỗng -> tạo mới; nếu có -> vẫn dùng,
+            # nhưng nếu đụng lỗi "in use" thì vòng sau sẽ tạo mới tmp.
             if not self.user_data_dir:
                 self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
             else:
-                # đảm bảo thư mục tồn tại và trống (nếu bạn cố tình truyền một đường dẫn custom)
                 os.makedirs(self.user_data_dir, exist_ok=True)
 
-            options.add_argument(f"--user-data-dir={self.user_data_dir}")
+            options = self._build_options(
+                binary_path=self.chrome_path if getattr(self, "chrome_path", None) else None,
+                user_data_dir=self.user_data_dir,
+                headless=self.headless
+            )
 
             try:
                 self.driver = webdriver.Chrome(options=options)
-                # Nếu vào được đây là ok, break
                 return self.driver
             except SessionNotCreatedException as e:
                 last_err = e
-                # Tạo thư mục tạm MỚI rồi thử lại
-                # (xoá flag cũ trong options, vì options sẽ giữ nguyên arg nếu append chồng)
-                opts = []
-                for arg in options.arguments:
-                    if not arg.startswith("--user-data-dir="):
-                        opts.append(arg)
-                options.arguments = opts
+                # tạo user-data-dir mới cho lần sau
                 self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
-                # thử vòng lặp tiếp
+                continue
             except WebDriverException as e:
                 last_err = e
-                # tương tự: reset user-data-dir và thử lại
-                opts = []
-                for arg in options.arguments:
-                    if not arg.startswith("--user-data-dir="):
-                        opts.append(arg)
-                options.arguments = opts
+                # cũng tạo mới cho vòng sau (phòng khi do lock/socket)
                 self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
+                continue
 
-        # Nếu vẫn fail 3 lần, ném lỗi gốc ra
+        # hết retry -> ném lỗi
         raise last_err
 
     # ---------- Hook ----------
