@@ -12,7 +12,7 @@ GROUP_URL     = "https://www.facebook.com/thoibao.de"              # <— ĐỔI
 KEEP_LAST     = 350
 OUT_NDJSON    = "posts_all.ndjson"
 RAW_DUMPS_DIR = "raw_dumps"
-CHECKPOINT    = r"E:\NCS\fb-selenium\checkpoint.json"
+CHECKPOINT    = r"checkpoint.json"
 
 # Bật nếu muốn parse & ghi NDJSON (mặc định dump-only)
 ENABLE_PARSE = False
