@@ -9,6 +9,7 @@ Facebook Group GraphQL crawler — Class-based (resume-first)
 """
 
 import os, re, json, time, random, socket, subprocess, urllib.parse, datetime
+import shutil, tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from selenium import webdriver
@@ -31,7 +32,7 @@ except Exception:
     # ---- fallback nhanh nếu bạn không import configs ----
     CHROME_PATH = r""
     USER_DATA_DIR = r""      # nên trỏ thư mục TRỐNG, không phải profile thật
-    PROFILE_NAME  = "Default"
+    PROFILE_NAME  = ""
     REMOTE_PORT   = 9222
     GROUP_URL     = "https://www.facebook.com/groups/<your-group-id-or-slug>"
     KEEP_LAST     = 350
@@ -92,30 +93,33 @@ class GroupGraphQLCrawler:
         return False
 
     def start_driver(self) -> webdriver.Chrome:
-        # Không dùng profile thật: vẫn cần một user-data-dir trống để Chrome chạy ổn định.
-        args = [
-            self.chrome_path,
-            f'--remote-debugging-port={self.remote_port}',
-            f'--user-data-dir={self.user_data_dir}',      # trỏ thư mục TRỐNG
-            f'--profile-directory={self.profile_name}',   # "Default" ok
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-popup-blocking',
-            '--disable-default-apps',
-            '--disable-infobars',
-            '--window-size=1400,920',
-        ]
-        if self.headless:
-            args += ['--headless=new','--disable-gpu','--no-sandbox','--disable-dev-shm-usage']
-
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if not self._wait_port('127.0.0.1', self.remote_port, timeout=20):
-            raise RuntimeError(f"Chrome remote debugging port {self.remote_port} not available.")
-
         options = Options()
-        options.add_experimental_option("debuggerAddress", f"127.0.0.1:{self.remote_port}")
+
+        # Optional: nếu bạn biết rõ chrome_path
+        if self.chrome_path:
+            options.binary_location = self.chrome_path
+        else:
+            # Thử tự tìm binary; nếu không thấy, Selenium Manager vẫn tự handle
+            for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
+                if shutil.which(cand):
+                    options.binary_location = shutil.which(cand)
+                    break
+
+        # Linux flags
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--window-size=1400,920")
+
+        # Headless hay không tuỳ bạn
+        if self.headless:
+            options.add_argument("--headless=new")
+
+        # user-data-dir: nếu trống, tạo tạm để ngăn Chrome đè vào profile mặc định
+        if not self.user_data_dir:
+            self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
+        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+        # KHÔNG cần remote debugging port / subprocess
         self.driver = webdriver.Chrome(options=options)
         return self.driver
 

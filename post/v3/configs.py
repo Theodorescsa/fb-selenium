@@ -2,9 +2,9 @@
 # CONFIG — nhớ sửa GROUP_URL
 # =========================
 import re
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
+CHROME_PATH   = r""
+USER_DATA_DIR = r""
+PROFILE_NAME  = ""
 REMOTE_PORT   = 9222
 
 # GROUP_URL     = "https://web.facebook.com/groups/laptrinhvienit"  # <— ĐỔI Ở ĐÂY
