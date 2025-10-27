@@ -10,6 +10,39 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from get_info import *
 import socket
+CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
+
+def strip_cursors_from_vars(v: dict) -> dict:
+    if not isinstance(v, dict): return {}
+    return {k: v for k, v in v.items() if k not in CURSOR_KEYS}
+
+def soft_refetch_form_and_cursor(driver, form, effective_template):
+    """
+    Bỏ cursor khỏi variables, refetch 1 phát để lấy state mới (như reload nhưng không cần UI).
+    Trả về (new_form, new_cursor, new_has_next, obj) hoặc (None, None, None, None) nếu fail.
+    """
+    try:
+        base = json.loads(form.get("variables", "{}"))
+    except Exception:
+        base = {}
+    # ghép lại template (không chứa cursor) rồi bỏ cursor hoàn toàn
+    base = merge_vars(base, effective_template)
+    base = strip_cursors_from_vars(base)
+
+    new_form = dict(form)
+    new_form["variables"] = json.dumps(base, separators=(",", ":"))
+
+    txt = js_fetch_in_page(driver, new_form, extra_headers={})
+    obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+    if not obj:
+        return None, None, None, None
+
+    cursors = deep_collect_cursors(obj)
+    new_has_next = deep_find_has_next(obj)
+    if new_has_next is None:
+        new_has_next = bool(cursors)
+    new_cursor = cursors[0][1] if cursors else None
+    return new_form, new_cursor, new_has_next, obj
 
 # =========================
 # CONFIG — nhớ sửa GROUP_URL
@@ -665,156 +698,35 @@ if __name__ == "__main__":
 
         save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=effective_template)
 
-        if no_progress_rounds >= 3:
-            print(f"[PAGE#{page}] no new items 3 rounds → reload & resume from checkpoint cursor")
-            # lưu checkpoint hiện tại (phòng trường hợp reload fail)
+        # === NEW: nếu next=False liên tiếp nhiều lần thì soft-refetch không cần UI ===
+        MAX_NO_NEXT_ROUNDS = 3
+        if not has_next and no_progress_rounds >= MAX_NO_NEXT_ROUNDS:
+            print(f"[PAGE#{page}] next=False x{no_progress_rounds} → soft-refetch doc_id/variables (no UI)")
+            # lưu checkpoint hiện tại để an toàn
             save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'),
                             last_query_name=friendly, vars_template=effective_template)
 
-            # jitter nhỏ để tránh pattern
-            time.sleep(random.uniform(2.0, 4.0))
+            # thử soft-refresh vài lần
+            refetch_ok = False
+            for attempt in range(1, 3):  # thử tối đa 2 lần
+                new_form, boot_cursor, boot_has_next, boot_obj = soft_refetch_form_and_cursor(d, form, effective_template)
+                if new_form and (boot_cursor or boot_has_next):
+                    # cập nhật form + cursor mới và reset bộ đếm
+                    form = new_form
+                    if boot_cursor:
+                        cursor = boot_cursor
+                    has_next = bool(boot_has_next)
+                    no_progress_rounds = 0
+                    refetch_ok = True
+                    print(f"[PAGE#{page}] soft-refetch OK (attempt {attempt}) → has_next={has_next} | cursor={str(cursor)[:24] if cursor else None}")
+                    break
+                time.sleep(random.uniform(1.0, 2.0))
 
-            # reload và bắt lại form/tokens mới rồi tiếp tục
-            new_form, new_friendly, new_doc_id = reload_and_refresh_form(
-                d, GROUP_URL, cursor, effective_template, timeout=25, poll=0.25
-            )
-            if new_form:
-                form = new_form
-                friendly = new_friendly or friendly
-                # có thể cập nhật last_doc_id nếu muốn theo dõi
-                # last_doc_id = new_doc_id or last_doc_id
-                no_progress_rounds = 0
-                # quay lại vòng lặp, gọi request tiếp theo luôn
-                continue
-            else:
-                # fallback cũ: nudge + backoff
-                for _ in range(2):
-                    d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-                    time.sleep(0.5)
-                time.sleep(random.uniform(2.0, 4.0))
-                no_progress_rounds = 0
+            if not refetch_ok:
+                print(f"[PAGE#{page}] soft-refetch failed → stop pagination.")
+                break  # hoặc: quay về cơ chế reload UI của bạn thay vì break
 
         time.sleep(random.uniform(0.7, 1.5))
 
     print(f"[DONE] wrote {total_written} posts → {OUT_NDJSON}")
     print(f"[INFO] resume later with checkpoint: {CHECKPOINT}")
-
-    # ======== AFTER LOOP: consolidate (story-only) + dedupe + export to Excel ========
-    try:
-        rows = []
-        if os.path.exists(OUT_NDJSON):
-            with open(OUT_NDJSON, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        rows.append(json.loads(line))
-                    except:
-                        pass
-        if rows:
-            df = pd.DataFrame(rows)
-
-            # 1) story-only
-            df = df[df.get("type").astype(str).str.lower().eq("story")].copy()
-
-            # 2) dedupe (giữ bản có tổng tương tác cao nhất, tie-break created_time mới hơn)
-            import hashlib
-
-            def _norm_str(x):
-                s = ("" if x is None else str(x)).strip().lower()
-                return s
-
-            def _safe_int(x):
-                try:
-                    return int(x)
-                except:
-                    return 0
-
-            def _hash_content(text):
-                try:
-                    b = (text or "").encode("utf-8")
-                    return hashlib.md5(b).hexdigest()[:16]
-                except:
-                    return "0"*16
-
-            link_key = df.get("link").map(_norm_str) if "link" in df.columns else ""
-            rid_key  = df.get("rid").map(_norm_str)  if "rid"  in df.columns else ""
-            aid_col  = df.get("author_id") if "author_id" in df.columns else ""
-            ct_col   = df.get("created_time") if "created_time" in df.columns else ""
-            txt_col  = df.get("content") if "content" in df.columns else ""
-
-            fallback_key = (
-                aid_col.map(lambda x: str(x) if x is not None else "") + "|" +
-                ct_col.map(_safe_int).map(str) + "|" +
-                txt_col.map(_hash_content)
-            )
-
-            df["__key"] = link_key
-            df.loc[df["__key"] == "", "__key"] = rid_key
-            df.loc[df["__key"] == "", "__key"] = fallback_key
-
-            for col in ["like","love","haha","wow","sad","angry","care","comment","share"]:
-                if col not in df.columns:
-                    df[col] = 0
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-
-            df["__score"] = (
-                df["like"] + df["love"] + df["haha"] + df["wow"] +
-                df["sad"] + df["angry"] + df["care"] + df["comment"] + df["share"]
-            )
-            df["__ct"] = pd.to_numeric(df.get("created_time"), errors="coerce").fillna(0).astype(int)
-
-            df = (
-                df.sort_values(["__key", "__score", "__ct"], ascending=[True, False, False])
-                  .drop_duplicates(subset=["__key"], keep="first")
-            )
-            df.drop(columns=["__key","__score","__ct"], inplace=True, errors="ignore")
-
-            # 3) Chuẩn cột & xuất Excel
-            want_cols = [
-                "id","type","link","author_id","author","author_link","avatar",
-                "created_time","content","image_url",
-                "like","comment","haha","wow","sad","love","angry","care","share",
-                "hashtag","video","source_id","is_share","link_share","type_share"
-            ]
-            for c in want_cols:
-                if c not in df.columns:
-                    df[c] = None
-
-            if "rid" in df.columns:
-                df["id"] = df["id"].fillna(df["rid"])
-
-            def _as_json_list(x):
-                if x is None or (isinstance(x, float) and pd.isna(x)):
-                    return "[]"
-                if isinstance(x, (list, tuple)):
-                    return json.dumps(list(x), ensure_ascii=False)
-                # nếu là chuỗi đã JSON → giữ nguyên nếu parse ra list được
-                try:
-                    obj = json.loads(x)
-                    if isinstance(obj, (list, tuple)):
-                        return json.dumps(list(obj), ensure_ascii=False)
-                except:
-                    pass
-                if isinstance(x, str) and x.strip():
-                    return json.dumps([x], ensure_ascii=False)
-                return "[]"
-
-            for col in ("image_url", "video", "hashtag"):
-                df[col] = df[col].map(_as_json_list)
-
-            def _as_int01(v):
-                if isinstance(v, bool):
-                    return 1 if v else 0
-                if isinstance(v, (int, float)):
-                    return int(v)
-                return 0
-            df["is_share"] = df["is_share"].map(_as_int01)
-
-            df = df[want_cols]
-
-            out_xlsx = Path(OUT_NDJSON).with_suffix(".xlsx")
-            df.to_excel(out_xlsx, index=False)
-            print(f"[EXPORT] Wrote Excel → {out_xlsx}")
-        else:
-            print("[EXPORT] NDJSON rỗng, bỏ qua xuất Excel.")
-    except Exception as e:
-        print(f"[EXPORT] Lỗi xuất Excel: {e}")

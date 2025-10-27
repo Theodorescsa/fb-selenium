@@ -135,6 +135,8 @@ class ScarperManager:
         threading.Timer(20, self.run_job).start()
 
     def parser_config_and_create_process(self, config):
+        config['mode']['num_thread'] = 1
+
         if config["mode"]["is_login"]:
             pass
         else:
