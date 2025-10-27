@@ -743,7 +743,7 @@ if __name__ == "__main__":
         checkpoint_path=CHECKPOINT,
         out_ndjson=OUT_NDJSON,
         keep_last=KEEP_LAST,
-        headless=False,               # để bạn xem đã login hay chưa
+        headless=True,               # để bạn xem đã login hay chưa
         cookies_path=COOKIES_PATH,
         localstorage_path=LOCALSTORAGE_PATH,
     )

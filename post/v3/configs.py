@@ -40,3 +40,5 @@ FB_ORIGINS = [
 ]
 COOKIES_PATH      = "./cookies.json"        # <-- file bạn vừa export
 LOCALSTORAGE_PATH = "./localstorage.json"   # <-- file bạn vừa export
+
+PROXY_URL= None  # ví dụ: "http://123.45.67.89:8080"
