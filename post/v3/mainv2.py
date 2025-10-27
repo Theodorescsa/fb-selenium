@@ -29,8 +29,8 @@ try:
     )
 except Exception:
     # ---- fallback nhanh nếu bạn không import configs ----
-    CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    USER_DATA_DIR = r"E:\NCS\temp_user_data"      # nên trỏ thư mục TRỐNG, không phải profile thật
+    CHROME_PATH = r""
+    USER_DATA_DIR = r""      # nên trỏ thư mục TRỐNG, không phải profile thật
     PROFILE_NAME  = "Default"
     REMOTE_PORT   = 9222
     GROUP_URL     = "https://www.facebook.com/groups/<your-group-id-or-slug>"
