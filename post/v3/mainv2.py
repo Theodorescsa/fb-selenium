@@ -58,7 +58,7 @@ class GroupGraphQLCrawler:
                  checkpoint_path: str = CHECKPOINT,
                  out_ndjson: str = OUT_NDJSON,
                  keep_last: int = KEEP_LAST,
-                 headless: bool = False,  # <-- mặc định KHÔNG headless để bạn kiểm tra login
+                 headless: bool = True,  # <-- mặc định KHÔNG headless để bạn kiểm tra login
                  cookies_path: Optional[str] = COOKIES_PATH,
                  localstorage_path: Optional[str] = LOCALSTORAGE_PATH):
         self.group_url = group_url
