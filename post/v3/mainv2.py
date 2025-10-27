@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import SessionNotCreatedException, WebDriverException
 
 # ===== Bạn có thể giữ utils/configs cũ nếu muốn =====
 from utils import (
@@ -95,33 +96,66 @@ class GroupGraphQLCrawler:
     def start_driver(self) -> webdriver.Chrome:
         options = Options()
 
-        # Optional: nếu bạn biết rõ chrome_path
+        # Nếu bạn muốn ép binary, gán self.chrome_path; nếu không cứ để Selenium Manager lo
         if self.chrome_path:
             options.binary_location = self.chrome_path
         else:
-            # Thử tự tìm binary; nếu không thấy, Selenium Manager vẫn tự handle
+            # optional: thử tìm nhanh binary trên Linux
             for cand in ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]:
-                if shutil.which(cand):
-                    options.binary_location = shutil.which(cand)
+                p = shutil.which(cand)
+                if p:
+                    options.binary_location = p
                     break
 
-        # Linux flags
+        # Flags thân thiện Linux
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--window-size=1400,920")
-
-        # Headless hay không tuỳ bạn
         if self.headless:
             options.add_argument("--headless=new")
 
-        # user-data-dir: nếu trống, tạo tạm để ngăn Chrome đè vào profile mặc định
-        if not self.user_data_dir:
-            self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
-        options.add_argument(f"--user-data-dir={self.user_data_dir}")
+        # KHÔNG dùng --profile-directory trên Linux
+        # Dùng user-data-dir TRỐNG, và tạo mới mỗi lần chạy
+        attempts = 0
+        last_err = None
+        while attempts < 3:
+            attempts += 1
+            # nếu user_data_dir chưa có -> tạo tạm; nếu có nhưng bị "in use" -> cũng tạo tạm
+            if not self.user_data_dir:
+                self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
+            else:
+                # đảm bảo thư mục tồn tại và trống (nếu bạn cố tình truyền một đường dẫn custom)
+                os.makedirs(self.user_data_dir, exist_ok=True)
 
-        # KHÔNG cần remote debugging port / subprocess
-        self.driver = webdriver.Chrome(options=options)
-        return self.driver
+            options.add_argument(f"--user-data-dir={self.user_data_dir}")
+
+            try:
+                self.driver = webdriver.Chrome(options=options)
+                # Nếu vào được đây là ok, break
+                return self.driver
+            except SessionNotCreatedException as e:
+                last_err = e
+                # Tạo thư mục tạm MỚI rồi thử lại
+                # (xoá flag cũ trong options, vì options sẽ giữ nguyên arg nếu append chồng)
+                opts = []
+                for arg in options.arguments:
+                    if not arg.startswith("--user-data-dir="):
+                        opts.append(arg)
+                options.arguments = opts
+                self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
+                # thử vòng lặp tiếp
+            except WebDriverException as e:
+                last_err = e
+                # tương tự: reset user-data-dir và thử lại
+                opts = []
+                for arg in options.arguments:
+                    if not arg.startswith("--user-data-dir="):
+                        opts.append(arg)
+                options.arguments = opts
+                self.user_data_dir = tempfile.mkdtemp(prefix="fbcrawl_ud_")
+
+        # Nếu vẫn fail 3 lần, ném lỗi gốc ra
+        raise last_err
 
     # ---------- Hook ----------
     def install_early_hook(self):
