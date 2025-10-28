@@ -140,6 +140,9 @@ def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver
     chrome_opts.add_argument("--disable-popup-blocking")
     chrome_opts.add_argument("--no-first-run")
     chrome_opts.add_argument("--no-default-browser-check")
+    chrome_opts.add_argument("--disable-background-timer-throttling")
+    chrome_opts.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_opts.add_argument("--disable-renderer-backgrounding")
 
     sw_options = None
     if proxy_url:
@@ -153,7 +156,7 @@ def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver
         }
 
     driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
-    driver.scopes = ['.*']  # hook all; có thể thu hẹp sau
+    driver.scopes = [r".*/api/graphql/.*"]
     return driver
 # =========================
 # (Optional) bootstrap_auth — nạp cookies/localStorage nếu có
@@ -243,6 +246,33 @@ def choose_best_graphql_obj(objs):
 # Cursor / HasNext / Time helpers
 # =========================
 CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
+from urllib.parse import urlencode
+
+def fetch_via_wire(driver, form):
+    url = "https://www.facebook.com/api/graphql/"
+    body = urlencode(form)
+    resp = driver.request(
+        "POST", url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.facebook.com",
+            "Referer": "https://www.facebook.com/"
+        },
+        timeout=25
+    )
+    return getattr(resp, "text", "")
+def current_cursor_from_form(form):
+    try:
+        v = json.loads(form.get("variables", "{}"))
+    except Exception:
+        return None
+    for k in ["cursor","after","endCursor","afterCursor","feedAfterCursor"]:
+        c = v.get(k)
+        if isinstance(c, str) and len(c) > 10:
+            return c
+    return None
+
 
 def deep_collect_cursors(obj):
     found = []
@@ -528,16 +558,61 @@ def coalesce_posts(items: List[dict]) -> List[dict]:
 # =========================
 # JS fetch with page cookies
 # =========================
-def js_fetch_in_page(driver, form_dict, extra_headers=None):
-    script = """
-    const url = "/api/graphql/";
-    const form = arguments[0];
-    const extra = arguments[1] || {};
-    const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
-    const body = new URLSearchParams(form).toString();
-    return fetch(url, {method:"POST", headers, body, credentials:"include"}).then(r=>r.text());
+import json as _json
+from selenium.common.exceptions import TimeoutException as _SETimeout
+
+def js_fetch_in_page(driver, form_dict, extra_headers=None, timeout_ms=20000):
     """
-    return driver.execute_script(script, form_dict, extra_headers or {})
+    Chạy fetch ngay TRONG context page (giữ cookie), có timeout bằng AbortController.
+    Trả về text body. Ném RuntimeError nếu fail.
+    """
+    script = r"""
+        const done = arguments[arguments.length - 1];
+        (async () => {
+          try {
+            const form = arguments[0] || {};
+            const extra = arguments[1] || {};
+            const timeout = arguments[2] || 20000;
+
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort('timeout'), timeout);
+
+            const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
+            const body = new URLSearchParams(form).toString();
+
+            // ensure we are on facebook origin (phòng crash nếu vừa navigate)
+            if (!location.host.includes('facebook.com')) {
+              clearTimeout(to);
+              return done(JSON.stringify({ok:false, error:"bad_origin:"+location.href}));
+            }
+
+            const res = await fetch("/api/graphql/", {
+              method: "POST",
+              headers,
+              body,
+              credentials: "include",
+              signal: ctrl.signal
+            });
+
+            const text = await res.text();
+            clearTimeout(to);
+            done(JSON.stringify({ok:true, status:res.status, text}));
+          } catch (e) {
+            done(JSON.stringify({ok:false, error: (e && e.message) ? e.message : String(e)}));
+          }
+        })();
+    """
+    # Nới timeout Selenium cho đủ lớn hơn timeout_ms
+    driver.set_script_timeout(max(5, int(timeout_ms/1000) + 10))
+    raw = driver.execute_async_script(script, form_dict, extra_headers or {}, int(timeout_ms))
+    try:
+        obj = _json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raise RuntimeError(f"js_fetch_in_page: bad_return {raw!r}")
+
+    if not obj.get("ok"):
+        raise RuntimeError(f"js_fetch_in_page: {obj.get('error')}")
+    return obj.get("text", "")
 
 # =========================
 # Soft-refetch & reload
@@ -631,9 +706,57 @@ def paginate_window(d, form, vars_template, seen_ids: set,
         form = set_time_window_on_form(form, t_from, t_to, vars_template)
 
     page = 0
+    has_next = False
+    cursor_for_reload = None      # <-- thêm dòng này
+
     while True:
         page += 1
-        txt = js_fetch_in_page(d, form, extra_headers={})
+        max_tries = 3
+        last_err = None
+        for attempt in range(1, max_tries+1):
+            try:
+                txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                break
+            except (_SETimeout, RuntimeError) as e:
+                last_err = e
+                if "bad_origin:" in str(e):
+                    d.get(GROUP_URL); time.sleep(1.2)
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                        break  # thành công thì thoát retry loop
+                    except Exception as _e2:
+                        # tiếp tục logic retry bình thường bên dưới
+                        pass
+                print(f"[WARN] fetch page try {attempt}/{max_tries} failed: {e}")
+                time.sleep(random.uniform(0.8, 1.6))
+
+                # lần 2: thử soft-refetch form (không đổi slice)
+                if attempt == 2:
+                    new_form, boot_cursor, boot_has_next, _ = soft_refetch_form_and_cursor(d, form, vars_template)
+                    if new_form:
+                        form = new_form
+                        if (t_from is not None) or (t_to is not None):
+                            form = set_time_window_on_form(form, t_from, t_to, vars_template)
+
+                # lần 3: hard reload doc_id (đổi doc khác)
+                if attempt == max_tries:
+                    form2, friendly2, docid2 = reload_and_refresh_form(d, GROUP_URL, None, vars_template)
+                    if form2:
+                        form = form2
+                        if (t_from is not None) or (t_to is not None):
+                            form = set_time_window_on_form(form, t_from, t_to, vars_template)
+                    # thử 1 nhát cuối
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=25000)
+                        break
+                    except Exception as e2:
+                        try:
+                            txt = fetch_via_wire(d, form)
+                            if txt:
+                                break
+                        except Exception:
+                            pass
+                        raise
         obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
         with open(os.path.join(RAW_DUMPS_DIR, f"slice_{t_from or 'None'}_{t_to or 'None'}_p{page}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -656,6 +779,10 @@ def paginate_window(d, form, vars_template, seen_ids: set,
 
         if fresh:
             append_ndjson(fresh)
+            if page % 200 == 0:
+                with open(OUT_NDJSON, "a", encoding="utf-8") as _f:
+                    _f.flush()
+                    os.fsync(_f.fileno())
             for p in fresh:
                 for k in _all_join_keys(p): seen_ids.add(k)
             total_new += len(fresh)
@@ -675,7 +802,10 @@ def paginate_window(d, form, vars_template, seen_ids: set,
         has_next = deep_find_has_next(obj)
         if has_next is None: has_next = bool(cursors)
         new_cursor = cursors[0][1] if cursors else None
-
+        if new_cursor:
+            cursor_for_reload = new_cursor
+        elif not cursor_for_reload:
+            cursor_for_reload = current_cursor_from_form(form)
         print(f"[SLICE {t_from or '-inf'}→{t_to or '+inf'}] p{page} got {len(page_posts)} (new {len(fresh)}), total_new={total_new}, next={has_next}")
 
         # 🔸 CHECKPOINT REALTIME mỗi page
@@ -707,6 +837,24 @@ def paginate_window(d, form, vars_template, seen_ids: set,
         # có next: tiếp
         if new_cursor:
             form = update_vars_for_next_cursor(form, new_cursor, vars_template)
+        if page % 700 == 0:
+            # đảm bảo có cursor để nối trang; fallback đọc từ form đang dùng
+            if not cursor_for_reload:
+                cursor_for_reload = current_cursor_from_form(form)
+
+            form2, _, _ = reload_and_refresh_form(
+                d, GROUP_URL, cursor_for_reload, vars_template
+            )
+            if form2:
+                form = form2
+                # giữ nguyên cửa sổ thời gian nếu đang chạy slice
+                if (t_from is not None) or (t_to is not None):
+                    form = set_time_window_on_form(form, t_from, t_to, vars_template)
+
+                # reset “no progress” để tránh dừng sớm vì vừa reload doc
+                no_progress_rounds = 0
+                # continue để sang vòng sau gọi đúng trang kế tiếp
+                continue
 
         time.sleep(random.uniform(0.7, 1.4))
 
@@ -784,7 +932,14 @@ def run_year_by_year(d, boot_form, vars_template, seen_ids):
 # MAIN
 # =========================
 if __name__ == "__main__":
-    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    d = start_driver_with_proxy(PROXY_URL, headless=True)
+    d.set_script_timeout(40)  # mặc định 30s, ta nới nhẹ
+    try:
+        d.execute_cdp_cmd("Network.enable", {})
+        d.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+    except Exception:
+        pass
+
     bootstrap_auth(d)  # nếu có file cookies/localStorage thì nạp; còn không sẽ bỏ qua
 
     try:

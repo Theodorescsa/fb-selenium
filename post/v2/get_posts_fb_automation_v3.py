@@ -7,6 +7,7 @@ Facebook GraphQL Feed Crawler — resume-first + time slicing + year-by-year + m
 - Khi tiến độ chậm / next=False, thử soft-refetch (không đụng UI) hoặc hard-reload form.
 - Hỗ trợ beforeTime/afterTime (epoch giây) để "đào lùi" theo mốc thời gian.
 - Runner year-by-year: cắt theo năm để vét nhiều lịch sử hơn.
+- Checkpoint realtime: lưu sau mỗi trang & trước/sau mỗi slice năm.
 
 ⚠️ Chỉ crawl nội dung bạn có quyền truy cập. Tôn trọng Điều khoản sử dụng của nền tảng.
 """
@@ -14,30 +15,29 @@ Facebook GraphQL Feed Crawler — resume-first + time slicing + year-by-year + m
 import os, re, json, time, random, datetime, urllib.parse, subprocess, socket
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlunparse
-
-from selenium import webdriver
+from pathlib import Path
+from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
 
 # =========================
 # CONFIG — chỉnh theo máy bạn
 # =========================
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
-REMOTE_PORT   = 9222
+
+HERE = Path(__file__).resolve().parent
 
 # Page/Group/Profile gốc bạn muốn crawl
 GROUP_URL     = "https://www.facebook.com/thoibao.de"
 
 # (Optional) Nếu muốn nạp login thủ công từ file, set path 2 hằng dưới; nếu không, để None:
-COOKIES_PATH       = None   # ví dụ: r".\cookies.json"
-LOCALSTORAGE_PATH  = None   # ví dụ: r".\localstorage.json"
-
+COOKIES_PATH         = HERE / "authen" / "cookies.json"
+LOCALSTORAGE_PATH    = HERE / "authen" / "localstorage.json"
+SESSIONSTORAGE_PATH  = HERE / "authen" / "sessionstorage.json"
+PROXY_URL = ""
 # Lưu trữ
 KEEP_LAST     = 350
-OUT_NDJSON    = "posts_all_v3.ndjson"
-RAW_DUMPS_DIR = "raw_dumps_v3"
-CHECKPOINT    = "checkpoint_v3.json"
+OUT_NDJSON    = "posts_all.ndjson"
+RAW_DUMPS_DIR = "raw_dumps"
+CHECKPOINT    = "checkpoint.json"
 
 # Giới hạn “đào lùi” theo năm (bao nhiêu năm về trước)
 STOP_AT_YEAR  = 2015  # đổi tùy ý
@@ -127,56 +127,48 @@ def _wait_port(host: str, port: int, timeout: float = 20.0, poll: float = 0.1) -
             time.sleep(poll)
     return False
 
-def start_driver(chrome_path, user_data_dir, profile_name, port=REMOTE_PORT, headless=True):
-    args = [
-        chrome_path,
-        f'--remote-debugging-port={port}',
-        f'--user-data-dir={user_data_dir}',
-        f'--profile-directory={profile_name}',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-popup-blocking',
-        '--disable-default-apps',
-        '--disable-infobars',
-    ]
+def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver.Chrome:
+    chrome_opts = Options()
     if headless:
-        args += ['--headless=new', '--disable-gpu', '--no-sandbox',
-                 '--disable-dev-shm-usage', '--window-size=1920,1080']
+        chrome_opts.add_argument("--headless=new")
+        chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--window-size=1920,1080")
+    chrome_opts.add_argument("--disable-extensions")
+    chrome_opts.add_argument("--disable-background-networking")
+    chrome_opts.add_argument("--disable-popup-blocking")
+    chrome_opts.add_argument("--no-first-run")
+    chrome_opts.add_argument("--no-default-browser-check")
+    chrome_opts.add_argument("--disable-background-timer-throttling")
+    chrome_opts.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_opts.add_argument("--disable-renderer-backgrounding")
 
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    ok = _wait_port('127.0.0.1', port, timeout=20.0)
-    if not ok and headless:
-        proc.kill()
-        time.sleep(0.5)
-        # thử non-headless
-        args = [a for a in args if not a.startswith('--headless')]
-        args += ['--window-size=1920,1080']
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        ok = _wait_port('127.0.0.1', port, timeout=20.0)
-    if not ok:
-        proc.kill()
-        raise RuntimeError(f"Không mở được remote debugging port {port}")
+    sw_options = None
+    if proxy_url:
+        sw_options = {
+            "proxy": {
+                "http":  proxy_url,
+                "https": proxy_url,
+                "no_proxy": "localhost,127.0.0.1",
+            },
+            # "verify_ssl": False,  # nếu proxy self-signed
+        }
 
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    driver = webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
+    driver.scopes = [r".*/api/graphql/.*"]
     return driver
-
 # =========================
 # (Optional) bootstrap_auth — nạp cookies/localStorage nếu có
 # =========================
 def bootstrap_auth(d):
     if COOKIES_PATH and os.path.exists(COOKIES_PATH):
         try:
-            d.get("https://www.facebook.com/")  # open first to set domain
+            d.get("https://www.facebook.com/")
             with open(COOKIES_PATH, "r", encoding="utf-8") as f:
                 cookies = json.load(f)
             for c in cookies:
-                # minimal cookie fields
                 cookie = {k: c[k] for k in ("name","value","domain","path","secure","httpOnly","expiry") if k in c}
-                # Selenium expects 'expires' not 'expiry' sometimes
                 if "expiry" in cookie and "expires" not in cookie:
                     cookie["expires"] = cookie.pop("expiry")
                 d.add_cookie(cookie)
@@ -254,6 +246,33 @@ def choose_best_graphql_obj(objs):
 # Cursor / HasNext / Time helpers
 # =========================
 CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
+from urllib.parse import urlencode
+
+def fetch_via_wire(driver, form):
+    url = "https://www.facebook.com/api/graphql/"
+    body = urlencode(form)
+    resp = driver.request(
+        "POST", url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.facebook.com",
+            "Referer": "https://www.facebook.com/"
+        },
+        timeout=25
+    )
+    return getattr(resp, "text", "")
+def current_cursor_from_form(form):
+    try:
+        v = json.loads(form.get("variables", "{}"))
+    except Exception:
+        return None
+    for k in ["cursor","after","endCursor","afterCursor","feedAfterCursor"]:
+        c = v.get(k)
+        if isinstance(c, str) and len(c) > 10:
+            return c
+    return None
+
 
 def deep_collect_cursors(obj):
     found = []
@@ -539,16 +558,61 @@ def coalesce_posts(items: List[dict]) -> List[dict]:
 # =========================
 # JS fetch with page cookies
 # =========================
-def js_fetch_in_page(driver, form_dict, extra_headers=None):
-    script = """
-    const url = "/api/graphql/";
-    const form = arguments[0];
-    const extra = arguments[1] || {};
-    const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
-    const body = new URLSearchParams(form).toString();
-    return fetch(url, {method:"POST", headers, body, credentials:"include"}).then(r=>r.text());
+import json as _json
+from selenium.common.exceptions import TimeoutException as _SETimeout
+
+def js_fetch_in_page(driver, form_dict, extra_headers=None, timeout_ms=20000):
     """
-    return driver.execute_script(script, form_dict, extra_headers or {})
+    Chạy fetch ngay TRONG context page (giữ cookie), có timeout bằng AbortController.
+    Trả về text body. Ném RuntimeError nếu fail.
+    """
+    script = r"""
+        const done = arguments[arguments.length - 1];
+        (async () => {
+          try {
+            const form = arguments[0] || {};
+            const extra = arguments[1] || {};
+            const timeout = arguments[2] || 20000;
+
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort('timeout'), timeout);
+
+            const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
+            const body = new URLSearchParams(form).toString();
+
+            // ensure we are on facebook origin (phòng crash nếu vừa navigate)
+            if (!location.host.includes('facebook.com')) {
+              clearTimeout(to);
+              return done(JSON.stringify({ok:false, error:"bad_origin:"+location.href}));
+            }
+
+            const res = await fetch("/api/graphql/", {
+              method: "POST",
+              headers,
+              body,
+              credentials: "include",
+              signal: ctrl.signal
+            });
+
+            const text = await res.text();
+            clearTimeout(to);
+            done(JSON.stringify({ok:true, status:res.status, text}));
+          } catch (e) {
+            done(JSON.stringify({ok:false, error: (e && e.message) ? e.message : String(e)}));
+          }
+        })();
+    """
+    # Nới timeout Selenium cho đủ lớn hơn timeout_ms
+    driver.set_script_timeout(max(5, int(timeout_ms/1000) + 10))
+    raw = driver.execute_async_script(script, form_dict, extra_headers or {}, int(timeout_ms))
+    try:
+        obj = _json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raise RuntimeError(f"js_fetch_in_page: bad_return {raw!r}")
+
+    if not obj.get("ok"):
+        raise RuntimeError(f"js_fetch_in_page: {obj.get('error')}")
+    return obj.get("text", "")
 
 # =========================
 # Soft-refetch & reload
@@ -590,13 +654,15 @@ def reload_and_refresh_form(d, group_url, cursor, vars_template, timeout=25, pol
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT):
         return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
-                "slice_to": None, "slice_from": None, "year_cursor": None}
+                "slice_to": None, "slice_from": None, "year": None, "mode": None,
+                "page": None, "min_created": None}
     try:
         with open(CHECKPOINT, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
         return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
-                "slice_to": None, "slice_from": None, "year_cursor": None}
+                "slice_to": None, "slice_from": None, "year": None, "mode": None,
+                "page": None, "min_created": None}
 
 def save_checkpoint(**kw):
     data = load_checkpoint()
@@ -615,7 +681,7 @@ def normalize_seen_ids(seen_ids):
     return set(seen_ids or [])
 
 # =========================
-# Paginate 1 cửa sổ thời gian (optional t_from/t_to)
+# Paginate 1 cửa sổ thời gian (optional t_from/t_to) + CHECKPOINT REALTIME
 # =========================
 def paginate_window(d, form, vars_template, seen_ids: set,
                     t_from: Optional[int]=None, t_to: Optional[int]=None,
@@ -631,13 +697,66 @@ def paginate_window(d, form, vars_template, seen_ids: set,
     min_created = None
     no_progress_rounds = 0
 
+    mode_str = "time" if (t_from is not None or t_to is not None) else "warmup"
+    if mode_str == "time":
+        print(f"[MODE] Time-slice window: from={t_from} to={t_to}")
+
+    # nếu có cửa sổ thời gian → ghim vào variables trước
     if (t_from is not None) or (t_to is not None):
         form = set_time_window_on_form(form, t_from, t_to, vars_template)
 
     page = 0
+    has_next = False
+    cursor_for_reload = None      # <-- thêm dòng này
+
     while True:
         page += 1
-        txt = js_fetch_in_page(d, form, extra_headers={})
+        max_tries = 3
+        last_err = None
+        for attempt in range(1, max_tries+1):
+            try:
+                txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                break
+            except (_SETimeout, RuntimeError) as e:
+                last_err = e
+                if "bad_origin:" in str(e):
+                    d.get(GROUP_URL); time.sleep(1.2)
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                        break  # thành công thì thoát retry loop
+                    except Exception as _e2:
+                        # tiếp tục logic retry bình thường bên dưới
+                        pass
+                print(f"[WARN] fetch page try {attempt}/{max_tries} failed: {e}")
+                time.sleep(random.uniform(0.8, 1.6))
+
+                # lần 2: thử soft-refetch form (không đổi slice)
+                if attempt == 2:
+                    new_form, boot_cursor, boot_has_next, _ = soft_refetch_form_and_cursor(d, form, vars_template)
+                    if new_form:
+                        form = new_form
+                        if (t_from is not None) or (t_to is not None):
+                            form = set_time_window_on_form(form, t_from, t_to, vars_template)
+
+                # lần 3: hard reload doc_id (đổi doc khác)
+                if attempt == max_tries:
+                    form2, friendly2, docid2 = reload_and_refresh_form(d, GROUP_URL, None, vars_template)
+                    if form2:
+                        form = form2
+                        if (t_from is not None) or (t_to is not None):
+                            form = set_time_window_on_form(form, t_from, t_to, vars_template)
+                    # thử 1 nhát cuối
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=25000)
+                        break
+                    except Exception as e2:
+                        try:
+                            txt = fetch_via_wire(d, form)
+                            if txt:
+                                break
+                        except Exception:
+                            pass
+                        raise
         obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
         with open(os.path.join(RAW_DUMPS_DIR, f"slice_{t_from or 'None'}_{t_to or 'None'}_p{page}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
@@ -660,6 +779,10 @@ def paginate_window(d, form, vars_template, seen_ids: set,
 
         if fresh:
             append_ndjson(fresh)
+            if page % 200 == 0:
+                with open(OUT_NDJSON, "a", encoding="utf-8") as _f:
+                    _f.flush()
+                    os.fsync(_f.fileno())
             for p in fresh:
                 for k in _all_join_keys(p): seen_ids.add(k)
             total_new += len(fresh)
@@ -679,15 +802,34 @@ def paginate_window(d, form, vars_template, seen_ids: set,
         has_next = deep_find_has_next(obj)
         if has_next is None: has_next = bool(cursors)
         new_cursor = cursors[0][1] if cursors else None
-
+        if new_cursor:
+            cursor_for_reload = new_cursor
+        elif not cursor_for_reload:
+            cursor_for_reload = current_cursor_from_form(form)
         print(f"[SLICE {t_from or '-inf'}→{t_to or '+inf'}] p{page} got {len(page_posts)} (new {len(fresh)}), total_new={total_new}, next={has_next}")
+
+        # 🔸 CHECKPOINT REALTIME mỗi page
+        save_checkpoint(
+            cursor=new_cursor,
+            seen_ids=list(seen_ids),
+            vars_template=vars_template,
+            mode=mode_str,
+            slice_from=t_from,
+            slice_to=t_to,
+            year=(datetime.datetime.utcfromtimestamp(t_to).year
+                  if (t_to and mode_str == "time") else None),
+            page=page,
+            min_created=min_created
+        )
 
         if not has_next or (page_limit and page >= page_limit):
             # hết trang trong slice hiện tại → thử soft-refetch để "nạp" doc khác
             if no_progress_rounds >= 2:
                 new_form, boot_cursor, boot_has_next, _ = soft_refetch_form_and_cursor(d, form, vars_template)
                 if new_form and (boot_cursor or boot_has_next):
-                    form = set_time_window_on_form(new_form, t_from, t_to, vars_template)
+                    form = new_form
+                    if (t_from is not None) or (t_to is not None):
+                        form = set_time_window_on_form(form, t_from, t_to, vars_template)
                     no_progress_rounds = 0
                     continue
             break
@@ -695,13 +837,31 @@ def paginate_window(d, form, vars_template, seen_ids: set,
         # có next: tiếp
         if new_cursor:
             form = update_vars_for_next_cursor(form, new_cursor, vars_template)
+        if page % 700 == 0:
+            # đảm bảo có cursor để nối trang; fallback đọc từ form đang dùng
+            if not cursor_for_reload:
+                cursor_for_reload = current_cursor_from_form(form)
+
+            form2, _, _ = reload_and_refresh_form(
+                d, GROUP_URL, cursor_for_reload, vars_template
+            )
+            if form2:
+                form = form2
+                # giữ nguyên cửa sổ thời gian nếu đang chạy slice
+                if (t_from is not None) or (t_to is not None):
+                    form = set_time_window_on_form(form, t_from, t_to, vars_template)
+
+                # reset “no progress” để tránh dừng sớm vì vừa reload doc
+                no_progress_rounds = 0
+                # continue để sang vòng sau gọi đúng trang kế tiếp
+                continue
 
         time.sleep(random.uniform(0.7, 1.4))
 
     return total_new, min_created, bool(has_next)
 
 # =========================
-# Year-by-year runner
+# Year-by-year runner (có checkpoint)
 # =========================
 def run_year_by_year(d, boot_form, vars_template, seen_ids):
     """
@@ -727,8 +887,16 @@ def run_year_by_year(d, boot_form, vars_template, seen_ids):
             break
 
         start_of_year = int(datetime.datetime(year, 1, 1, 0, 0, 0).timestamp())
-        print(f"[YEAR] Slice year {year}: {start_of_year} → {cur_to}")
+        print(f"[YEAR] >>> year {year}: slice {start_of_year} → {cur_to}")
 
+        # 🔸 Save checkpoint trước khi vào slice năm
+        save_checkpoint(
+            cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+            mode="time", slice_from=start_of_year, slice_to=cur_to, year=year,
+            page=0, min_created=None
+        )
+
+        # Hard reload form để refresh doc_id/tokens theo năm mới
         form2, friendly, docid = reload_and_refresh_form(d, GROUP_URL, None, vars_template)
         if not form2:
             print("[YEAR] reload form fail, dùng form cũ.")
@@ -738,20 +906,40 @@ def run_year_by_year(d, boot_form, vars_template, seen_ids):
                                             t_from=start_of_year, t_to=cur_to)
         total_all += added
 
+        # Cập nhật “đào lùi”: nếu trong năm còn min_ct2 thì dồn tiếp xuống < min_ct2
         if min_ct2 and min_ct2 < cur_to:
             cur_to = min_ct2
         else:
+            # Hết năm này → chuyển sang năm trước (đặt cur_to = đầu năm)
             cur_to = start_of_year
+
+        # 🔸 Checkpoint sau slice năm
+        save_checkpoint(
+            cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+            mode="time", slice_from=start_of_year, slice_to=cur_to, year=year
+        )
 
         time.sleep(random.uniform(1.0, 2.0))
 
+    # 🔸 Clear mode khi xong
+    save_checkpoint(
+        cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+        mode=None, slice_from=None, slice_to=None, year=None
+    )
     return total_all
 
 # =========================
 # MAIN
 # =========================
 if __name__ == "__main__":
-    d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT, headless=False)
+    d = start_driver_with_proxy(PROXY_URL, headless=True)
+    d.set_script_timeout(40)  # mặc định 30s, ta nới nhẹ
+    try:
+        d.execute_cdp_cmd("Network.enable", {})
+        d.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+    except Exception:
+        pass
+
     bootstrap_auth(d)  # nếu có file cookies/localStorage thì nạp; còn không sẽ bỏ qua
 
     try:
@@ -776,13 +964,22 @@ if __name__ == "__main__":
     seen_ids      = normalize_seen_ids(state.get("seen_ids"))
     cursor        = state.get("cursor")
     vars_template = state.get("vars_template") or template_now
+    mode          = state.get("mode")
+    slice_from    = state.get("slice_from")
+    slice_to      = state.get("slice_to")
+    resume_year   = state.get("year")
 
     effective_template = vars_template or template_now
 
-    # Nếu có cursor → resume thẳng
+    # Nếu có cursor trong checkpoint → bơm vào form
     if cursor:
         print(f"[RESUME] cursor={str(cursor)[:24]}..., friendly={friendly}")
         form = update_vars_for_next_cursor(form, cursor, vars_template=effective_template)
+
+    # Nếu checkpoint đang ở time-slice → set lại cửa sổ thời gian trước khi chạy
+    if mode == "time" and (slice_from is not None or slice_to is not None):
+        print(f"[RESUME] Time-slice resume: from={slice_from}, to={slice_to}, year={resume_year}")
+        form = set_time_window_on_form(form, slice_from, slice_to, effective_template)
 
     total_got = run_year_by_year(d, form, effective_template, seen_ids)
 
