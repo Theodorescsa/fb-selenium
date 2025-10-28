@@ -173,8 +173,46 @@ def install_early_hook(driver):
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": HOOK_SRC})
 
 def hook_graphql(driver):
-    # đã có early hook; hàm này giữ cho tương thích nếu bạn muốn re-inject tại runtime
-    driver.execute_script("window.__gqlHooked = window.__gqlHooked || true; window.__gqlReqs = window.__gqlReqs || [];")
+    js = r"""
+    (function() {
+      if (window.__gqlHooked) return;
+      window.__gqlHooked = true;
+      window.__gqlReqs = window.__gqlReqs || [];
+
+      // wrap fetch
+      const _fetch = window.fetch;
+      window.fetch = function(input, init) {
+        try {
+          const url = (typeof input === 'string') ? input : (input && input.url) || '';
+          const method = (init && init.method) || 'GET';
+          let body = (init && init.body) || '';
+          if (body instanceof URLSearchParams) body = body.toString();
+          if (String(url).includes('/api/graphql/')) {
+            window.__gqlReqs.push({ts:Date.now(), type:'fetch', url:String(url), method:String(method), body:String(body||'')});
+          }
+        } catch(e) {}
+        return _fetch.apply(this, arguments);
+      };
+
+      // wrap XHR
+      const _open = XMLHttpRequest.prototype.open;
+      const _send = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        this.__gql_meta = { url: String(url||''), method: String(method||'GET') };
+        return _open.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function(body) {
+        try {
+          const meta = this.__gql_meta || {};
+          if (String(meta.url).includes('/api/graphql/')) {
+            window.__gqlReqs.push({ts:Date.now(), type:'xhr', url:String(meta.url), method:String(meta.method||'GET'), body:String(body||'')});
+          }
+        } catch(e) {}
+        return _send.apply(this, arguments);
+      };
+    })();
+    """
+    driver.execute_script(js)
 
 # =========================
 # Utils (GraphQL buffer)

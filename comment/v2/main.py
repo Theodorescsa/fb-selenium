@@ -59,167 +59,7 @@ def parse_form(body_str: str):
     qs = urllib.parse.parse_qs(body_str, keep_blank_values=True)
     return {k:(v[0] if isinstance(v, list) else v) for k,v in qs.items()}
 
-def _deep_iter(o):
-    if isinstance(o, dict):
-        for k,v in o.items():
-            yield k,v
-            if isinstance(v, (dict,list)):
-                yield from _deep_iter(v)
-    elif isinstance(o, list):
-        for v in o:
-            yield from _deep_iter(v)
 
-def find_pageinfo(obj):
-    if isinstance(obj, dict):
-        if "page_info" in obj and isinstance(obj["page_info"], dict):
-            pi = obj["page_info"]
-            return pi.get("end_cursor") or pi.get("endCursor"), pi.get("has_next_page")
-        for v in obj.values():
-            c = find_pageinfo(v)
-            if c: return c
-    elif isinstance(obj, list):
-        for v in obj:
-            c = find_pageinfo(v)
-            if c: return c
-    return (None, None)
-
-def extract_comment_texts(obj, out_list):
-    if isinstance(obj, dict):
-        if "body" in obj and isinstance(obj["body"], dict) and "text" in obj["body"]:
-            txt = obj["body"]["text"]
-            if isinstance(txt, str) and txt:
-                out_list.append(txt)
-        if "message" in obj and isinstance(obj["message"], dict) and "text" in obj["message"]:
-            txt = obj["message"]["text"]
-            if isinstance(txt, str) and txt:
-                out_list.append(txt)
-        for v in obj.values():
-            extract_comment_texts(v, out_list)
-    elif isinstance(obj, list):
-        for v in obj:
-            extract_comment_texts(v, out_list)
-
-# ---- REPLACE these helpers ----
-
-def _iter_all_dicts(o):
-    if isinstance(o, dict):
-        yield o
-        for v in o.values():
-            yield from _iter_all_dicts(v)
-    elif isinstance(o, list):
-        for v in o:
-            yield from _iter_all_dicts(v)
-
-def _read_pi(pi: dict):
-    if not isinstance(pi, dict):
-        return (None, None)
-    # key variants
-    end_cur = (pi.get("end_cursor") or pi.get("endCursor") or
-               pi.get("start_cursor") or pi.get("startCursor"))
-    has_next = pi.get("has_next_page")
-    if has_next is None:
-        has_next = pi.get("hasNextPage")
-    return end_cur, has_next
-
-def find_pageinfo_any(obj):
-    """
-    Tìm page_info theo đúng connection:
-      { edges: [...], page_info: {...} }
-    hoặc biến thể:
-      { nodes: [...], page_info: {...} }
-    Hỗ trợ cả camelCase 'pageInfo'.
-    """
-    # 1) Ưu tiên connection chuẩn
-    for d in _iter_all_dicts(obj):
-        if not isinstance(d, dict):
-            continue
-        # các khóa connection phổ biến
-        has_edges_or_nodes = ("edges" in d and isinstance(d.get("edges"), list)) or \
-                             ("nodes" in d and isinstance(d.get("nodes"), list))
-        if not has_edges_or_nodes:
-            continue
-
-        pi = d.get("page_info") or d.get("pageInfo")
-        if isinstance(pi, dict):
-            end_cur, has_next = _read_pi(pi)
-            if end_cur or has_next is not None:
-                return end_cur, has_next
-
-    # 2) Fallback: bất cứ nơi nào có page_info/pageInfo
-    for d in _iter_all_dicts(obj):
-        if not isinstance(d, dict):
-            continue
-        pi = d.get("page_info") or d.get("pageInfo")
-        if isinstance(pi, dict):
-            end_cur, has_next = _read_pi(pi)
-            if end_cur or has_next is not None:
-                return end_cur, has_next
-
-    # 3) Cực đoan: lượm end_cursor xuất hiện rải rác
-    for d in _iter_all_dicts(obj):
-        if not isinstance(d, dict):
-            continue
-        for k in ("end_cursor", "endCursor"):
-            if k in d and isinstance(d[k], str):
-                return d[k], None
-
-    return (None, None)
-
-def extract_comments_from_resptext(resp_text: str):
-    texts = []
-    try:
-        obj = json.loads(resp_text)
-    except:
-        return texts, None, None, None
-
-    # payload có thể là mảng (batched GraphQL)
-    payloads = obj if isinstance(obj, list) else [obj]
-
-    end_cursor = None
-    has_next = None
-    total = None
-
-    for pay in payloads:
-        # gom text bình luận
-        extract_comment_texts(pay, texts)
-
-        # lấy page_info theo connection
-        ec, hn = find_pageinfo_any(pay)
-        if ec:
-            end_cursor = ec
-        if hn is not None:
-            has_next = hn
-
-        # total count (nếu có)
-        try:
-            c = pay["data"]["node"]["comment_rendering_instance_for_feed_location"]["comments"]
-            total = c.get("count") or c.get("total_count") or total
-        except:
-            pass
-
-    return texts, end_cursor, total, obj
-
-def force_load_comments(driver):
-    js = r"""
-    (function(){
-      const dlg = document.querySelector('div[role="dialog"]');
-      if(!dlg) return false;
-      const commentBox = dlg.querySelector("div[aria-label*='Viết bình luận'], div[aria-label*='Write a comment']");
-      if(commentBox){
-        commentBox.scrollIntoView({block:'center'});
-        commentBox.focus();
-        return true;
-      }
-      const seeBtns = dlg.querySelectorAll("div[role='button']");
-      for(const b of seeBtns){
-        if(b.innerText.includes('Xem bình luận') || b.innerText.includes('View comments')){
-          b.click(); return true;
-        }
-      }
-      return false;
-    })();
-    """
-    return driver.execute_script(js)
 
 # =========================
 # Checkpoint
@@ -240,19 +80,6 @@ def save_checkpoint(data: dict, path="checkpoint_comments.json"):
 # =========================
 # GraphQL capture + bootstrap
 # =========================
-def wait_first_comment_request(driver, start_idx, timeout=10, poll=0.2):
-    end = time.time() + timeout
-    i = start_idx
-    while time.time() < end:
-        n = driver.execute_script("return (window.__gqlReqs||[]).length")
-        while i < n:
-            rec = driver.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
-            i += 1
-            if rec and match_comment_req(rec):
-                return rec
-        time.sleep(poll)
-    return None
-
 def match_comment_req(rec: dict):
     url = rec.get("url","")
     if "/api/graphql/" not in url: return False
@@ -260,8 +87,8 @@ def match_comment_req(rec: dict):
     body = rec.get("body","") or ""
     if "fb_api_req_friendly_name=" in body:
         if "CommentsListComponentsPaginationQuery" in body: return True
-        if "UFI2CommentsProviderPaginationQuery" in body: return True
-        if re.search(r"fb_api_req_friendly_name=CometUFI[^&]*Comments[^&]*Pagination", body): return True
+        elif "UFI2CommentsProviderPaginationQuery" in body: return True
+        elif re.search(r"fb_api_req_friendly_name=CometUFI[^&]*Comments[^&]*Pagination", body): return True
     if "variables=" in body:
         try:
             v = parse_form(body).get("variables","")
@@ -271,6 +98,24 @@ def match_comment_req(rec: dict):
             if keys & signs: return True
         except: pass
     return False
+def wait_first_comment_request(driver, start_idx, timeout=10, poll=0.2):
+    end = time.time() + timeout
+    i = start_idx
+    print("Waiting for first comment request after index", start_idx)
+    
+    while time.time() < end:
+        print("time.time() < end",time.time() < end)
+        n = driver.execute_script("return (window.__gqlReqs||[]).length")
+        print("n",n)
+        while i <= n:
+            rec = driver.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
+            i += 1
+            if rec and match_comment_req(rec):
+                return rec
+        time.sleep(poll)
+    return None
+
+
 
 def strip_cursors_from_vars(v: dict) -> dict:
     if not isinstance(v, dict): return {}
@@ -288,41 +133,22 @@ def detect_cursor_key(original_vars: dict) -> str:
 # Replay GraphQL inside the page (keeps auth/cookies)
 # =========================
 def graphql_post_in_page(driver, url: str, form_params: dict, override_vars: dict):
-    """
-    - driver: Selenium webdriver
-    - url: original /api/graphql/ endpoint
-    - form_params: original parsed form (doc_id, fb_api_req_friendly_name, variables, ... )
-    - override_vars: new variables dict (will be JSON-encoded & urlencoded)
-    Returns: responseText (str)
-    """
-    fp = dict(form_params)  # shallow copy
-    # encode variables
-    fp["variables"] = urllib.parse.quote_plus(json.dumps(override_vars, separators=(',',':'), ensure_ascii=False))
-    # Build body by preserving keys order-ish (not strictly required)
-    body_pairs = []
-    for k, v in fp.items():
-        if k == "variables":
-            body_pairs.append(f"variables={v}")
-        else:
-            body_pairs.append(f"{k}={urllib.parse.quote_plus(str(v))}")
-    body = "&".join(body_pairs)
-
+    fp = dict(form_params)
+    fp["variables"] = json.dumps(override_vars, separators=(',',':'), ensure_ascii=False)
+    body = urllib.parse.urlencode(fp)
     js = r"""
-    const url = arguments[0];
-    const body = arguments[1];
-    const cb = arguments[2];
+    const url = arguments[0], body = arguments[1], cb = arguments[2];
     fetch(url, {
-      method: 'POST',
-      credentials: 'include',
-      headers: {'content-type': 'application/x-www-form-urlencoded'},
-      body: body
-    }).then(r => r.text()).then(t => cb({ok:true, text:t})).catch(e => cb({ok:false, err:String(e)}));
+      method:'POST', credentials:'include',
+      headers:{'content-type':'application/x-www-form-urlencoded'},
+      body
+    }).then(r=>r.text()).then(t=>cb({ok:true,text:t}))
+      .catch(e=>cb({ok:false,err:String(e)}));
     """
-    # Use async script to wait for fetch
     driver.set_script_timeout(120)
     ret = driver.execute_async_script(js, url, body)
     if not ret or not ret.get("ok"):
-        raise RuntimeError("Replay GraphQL failed: %s" % (ret and ret.get("err")))
+        raise RuntimeError("Replay GraphQL failed: %s" % (ret and ret.get('err')))
     return ret["text"]
 
 # =========================
@@ -341,11 +167,10 @@ def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="chec
     # 1) ensure one lightweight scroll to produce first request
     baseline = driver.execute_script("return (window.__gqlReqs||[]).length")
     driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
+
     time.sleep(1.0)
 
-    first_req = wait_first_comment_request(driver, baseline, timeout=10, poll=0.2)
-    if not first_req:
-        raise TimeoutException("Không bắt được request comment đầu (hãy đảm bảo đã mở đúng permalink & sort 'All comments').")
+    first_req = wait_first_comment_request(driver, 0, timeout=12, poll=0.2)
 
     url = first_req.get("url")
     form = parse_form(first_req.get("body",""))
@@ -398,12 +223,13 @@ def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="chec
 
         # compose variables = template + cursor(if any)
         use_vars = dict(vars_template)
+        use_vars.setdefault("commentsAfterCount", 50)  # 25–100 đều ok
         if current_cursor:
             use_vars[cursor_key] = current_cursor
 
         # replay
         resp_text = graphql_post_in_page(driver, url, form, use_vars)
-        batch_texts, end_cursor, total_target, _ = extract_comments_from_resptext(resp_text)
+        batch_texts, end_cursor, total_target, _ = extract_full_posts_from_resptext(resp_text)
 
         if batch_texts:
             all_texts.extend(batch_texts)
@@ -437,15 +263,14 @@ def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="chec
 # =========================
 # MAIN
 # =========================
+from extract_comment_utils import extract_full_posts_from_resptext
 from get_comment_fb_utils import (
                                  set_sort_to_all_comments
                                  )
 from get_comment_fb_automation import (
                                  start_driver,
                                  install_early_hook,
-                                 hook_graphql,
-                                 parse_form,
-                                 match_comment_req)
+                                 hook_graphql)
 CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 USER_DATA_DIR = r"E:\NCS\Userdata"
 PROFILE_NAME  = "Profile 5"
@@ -481,13 +306,15 @@ if __name__ == "__main__":
 
     d.get(POST_URL)
     time.sleep(2)
-    set_sort_to_all_comments(d)
     hook_graphql(d)
+    time.sleep(0.5)
+
+    set_sort_to_all_comments(d)
 
     # ép FB tạo UFI nếu chưa có
     time.sleep(0.8)
         # 1) click “Xem thêm …” nếu có, else kéo đến comment cuối
-    for _ in range(10):
+    for _ in range(4):
         if click_view_more_if_any(d, max_clicks=1) == 0:
             if not scroll_to_last_comment(d):
                 d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")

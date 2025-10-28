@@ -1,517 +1,832 @@
-
+# -*- coding: utf-8 -*-
 """
-Hàm main của dự án
-"""
-# import os
-# import sys
-# sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from utils.log_utils import logger
-import os
-#from src.scraper_manager_thread_with_db import ScarperManager
-from src.scraper_manager_thead import ScarperManager
-path_db = {
-    "PATH_GROUP" : "db/Groups",
-    "PATH_PAGE" : "db/Pages",
-    "PATH_ERROR" : "db/Error",
-    "PATH_LINK" : "db/Links",
-    "PATH_SEARCH" : "db/Search",
-    "PATH_SHARE_POST" : "db/Share_post",
-    "PATH_UPDATE" : "db/Update"
-}
+Facebook GraphQL Feed Crawler — resume-first + time slicing + year-by-year + multi-doc fallback
+- Attach Chrome qua remote debugging (xài profile thật của bạn).
+- Hook sớm /api/graphql để "hứng" request và response.
+- Resume bằng cursor + seen_ids trong checkpoint.
+- Khi tiến độ chậm / next=False, thử soft-refetch (không đụng UI) hoặc hard-reload form.
+- Hỗ trợ beforeTime/afterTime (epoch giây) để "đào lùi" theo mốc thời gian.
+- Runner year-by-year: cắt theo năm để vét nhiều lịch sử hơn.
+- Checkpoint realtime: lưu sau mỗi trang & trước/sau mỗi slice năm.
 
-for key, val in path_db.items():
-    if not os.path.exists(val):
-        os.makedirs(val)
-
-def main():
-    logger.warning(
-        
-    "\n                    _oo0oo_                      \n"
-    "                   o8888888o                       \n"
-    "                   88' . '88                       \n"
-    "                   (| -_- |)                       \n"
-    "                   0\  =  /0                       \n"
-    "                 ___/`---'\___                     \n"
-    "               .' \\|     |// '.                   \n"
-    "              / \\|||  :  |||// \                  \n"
-    "             / _||||| -:- |||||- \                 \n"
-    "            |   | \\\  -  /// |   |                \n"
-    "            | \_|  ''\---/''  |_/ |                \n"
-    "             \ .-\__  '-' ___/-. /                 \n"
-    "           ___'. .' /--.--\ `. .'___               \n"
-    "        ."" '< `.___\_<|>_/___.' >' "".            \n"
-    "      | | :  `- \`.;`\ _ /`;.`/ - ` : | |          \n"
-    "      \  \ `_.   \_ __\ /__ _/   .-` /  /          \n"
-    "  =====`-.____`.___ \_____/___.-`___.-'=====       \n"
-    "                    `=---='                        \n"
-    "            It works … on my machine               \n"
-    "  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~      \n"
- 
-    )
-
-    sc = ScarperManager()
-    sc.run()
-    
-
-
-if __name__ == "__main__":
-    main()
-
-import threading
-from utils.utils import get_local_device_config
-from utils.log_utils import logger
-import schedule
-from datetime import datetime, timedelta
-from datetime import time as time_dt
-import time
-from queue import Queue
-from src.scraper_thread import ScraperThread
-from src.get_link_es import ElasticFunc
-from utils.utils import read_data_from_file
-import copy
-from configs import config as cfg
-# from multiprocessing import Manager
-import threading
-import os
-"""
-Class đọc file config, create task chạy config
+⚠️ Chỉ crawl nội dung bạn có quyền truy cập. Tôn trọng Điều khoản sử dụng của nền tảng.
 """
 
+import os, re, json, time, random, datetime, urllib.parse, subprocess, socket
+from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, urlunparse
+from pathlib import Path
+from seleniumwire import webdriver
+from selenium.webdriver.chrome.options import Options
 
-class ScarperManager:
-    process_scrapers = {}
+# =========================
+# CONFIG — chỉnh theo máy bạn
+# =========================
 
-    def __init__(self) -> None:
-        self.config_device = None
-    def run(self):
-        self.config_device = get_local_device_config()
-        num_config = len(self.config_device)
-        logger.info(f"Số config có trong file là {num_config}")
-        for config in self.config_device:
-            if config['mode']['time_run_schedule'] == 0:
-                current_time = datetime.now().time()
-                target_time = time_dt(int(config['mode']['start_time_run'].split(":")[0]), int(config['mode']['start_time_run'].split(":")[1]), 0) 
-                
-                # if self.config_device[i]['mode']['is_login'] == 1:
-                #     pass # trường hợp cần login tài khoản
-                # else: #trường hợp k cần login
-                #     pass
-                
-                if current_time > target_time:
-                    check_time = True
-                else:
-                    check_time = False
-                if int(config['mode']['time_expired']) > 1 or check_time:
-                    if config['mode']['is_login'] == 1:
-                        pass # trường hợp cần login tài khoản
-                    else: #trường hợp k cần login
-                        self.parser_config_and_create_process(config)
-                schedule.every(config['mode']['time_expired']).days.at(config['mode']['start_time_run'], "Asia/Ho_Chi_Minh").do(lambda cfg=config: self.parser_config_and_create_process(cfg))
-            else:
-                # schedule.every(config['mode']['time_run_schedule']).hours.do(lambda cfg=config: self.parser_config_and_create_process(cfg))
-                # self.parser_config_and_create_process(config)
-                threading.Thread(target=self.wait_run_schedule, args=(config,)).start()
-        #self.run_job()
-        run_job_thread = threading.Thread(target=self.run_job)
-        run_job_thread.start()
-        run_job_thread.join()
-    def wait_run_schedule(self, config):
-        target_time = time_dt(int(config['mode']['start_time_run'].split(":")[0]), int(config['mode']['start_time_run'].split(":")[1]), 0) 
-                
-        while datetime.now().time() < target_time:
-            print(f"Đang đợi đến {target_time} để chạy. Hiện tại {datetime.now().time()}")
-            time.sleep(20)
-            
-        schedule.every(config['mode']['time_run_schedule']).hours.do(lambda cfg=config: self.parser_config_and_create_process(cfg))
-        self.parser_config_and_create_process(config)
-    def run_job(self):
-        all_jobs = schedule.get_jobs()
-        logger.debug(self.process_scrapers)
-        for key, val in list(self.process_scrapers.items()):
-            if not val.is_alive():
-                del self.process_scrapers[key]
-        logger.warning(f"Pendding job {all_jobs}.......")
-        schedule.run_pending()
-        threading.Timer(20, self.run_job).start()
+HERE = Path(__file__).resolve().parent
 
-    def parser_config_and_create_process(self, config):
-        config['mode']['num_thread'] = 1
+# Page/Group/Profile gốc bạn muốn crawl
+GROUP_URL     = "https://www.facebook.com/thoibao.de"
 
-        if config["mode"]["is_login"]:
-            pass
-        else:
-            if config['mode']['id'] == 2:
-                if config['mode']['is_type'] == 0:
-                    logger.info(f"Số thread là {config['mode']['num_thread']}")
-                    queue_ = Queue()
-                    
-                    #Đọc danh sách các group từ file
-                    # for _ in config['mode']['group_id']:
-                    #     queue_.put(_)
-                    
-                    groups = read_data_from_file(path_file=cfg.PATH_TO_GROUP_ID)
-                    for _ in groups: #config['mode']['group_id']:
-                        queue_.put(_)
-                    logger.info(f"Tổng số group cần crawl là {queue_.qsize()}")
-                        
-                    ########
-                    if int(config['mode']['num_thread']) > 1:
-                        config_temp = copy.deepcopy(config)
-                        for i in range(config['mode']['num_thread']):
-                            config_temp['mode']['group_id'] = []
-                            config_temp['id'] = str(config['id'])  + "_" + str(i)
-                            self.start_scraper_not_login(config=config_temp, queue_=queue_)
-                    else:
-                        self.start_scraper_not_login(config=config, queue_=queue_)
-                elif config['mode']['is_type'] == 1:
-                    logger.info(f"Số thread là {config['mode']['num_thread']}")
-                    queue_ = Queue()
-                    pages = read_data_from_file(path_file=cfg.PATH_TO_PAGE_ID)
-                    
-                    for _ in pages: #config['mode']['page_id']:
-                        queue_.put(_)
-                        
-                    logger.info(f"Tổng số page cần crawl là {queue_.qsize()}")
-                    if int(config['mode']['num_thread']) > 1:
-                        config_temp = copy.deepcopy(config)
-                        for i in range(config['mode']['num_thread']):
-                            config_temp['mode']['page_id'] = []
-                            config_temp['id'] = str(config['id'])  + "_" + str(i)
-                            self.start_scraper_not_login(config=config_temp, queue_=queue_)
-                    else:
-                        self.start_scraper_not_login(config=config, queue_=queue_)
-            elif config['mode']['id'] == 3:
-                #lấy thông tin các post
-                
-                current_time = datetime.now()
-                time_check = current_time + timedelta(hours=config['mode']['time_expired'])#self.job_n_day[group_thread].next_run#current_time + timedelta(days=(config["mode"]["range_date"][-1]-config["mode"]["range_date"][0]))
+# (Optional) Nếu muốn nạp login thủ công từ file, set path 2 hằng dưới; nếu không, để None:
+COOKIES_PATH         = HERE / "authen" / "cookies.json"
+LOCALSTORAGE_PATH    = HERE / "authen" / "localstorage.json"
+SESSIONSTORAGE_PATH  = HERE / "authen" / "sessionstorage.json"
+PROXY_URL = ""
+# Lưu trữ
+KEEP_LAST     = 350
+OUT_NDJSON    = "posts_all.ndjson"
+RAW_DUMPS_DIR = "raw_dumps"
+CHECKPOINT    = "checkpoint.json"
 
-                queue_ = Queue()
-                files_page = [
-                    f for f in os.listdir("db/Pages_1")
-                    if os.path.isfile(os.path.join("db/Pages_1", f))
-                ]
-                files_group = [
-                    f for f in os.listdir("db/Groups")
-                    if os.path.isfile(os.path.join("db/Groups", f))
-                ]
-                files_page_done = [
-                    f for f in os.listdir("db/Update")
-                    if os.path.isfile(os.path.join("db/Update", f))
-                ]
-                list_posts_page = []
-                list_posts_group = []
-                list_posts_page_done = []
-                for file_page in files_page:
-                    data_p = read_data_from_file(path_file=f"db/Pages_1/{file_page}")
-                    list_posts_page.extend(data_p)
-                logger.info(f"Tổng số bài viết trong file page là {len(list_posts_page)}")
-                for file_group in files_group:
-                    data_g = read_data_from_file(path_file=f"db/Groups/{file_group}")
-                    list_posts_group.extend(data_g)
-                logger.info(f"Tổng số bài viết trong file group là {len(list_posts_group)}")
-                for file_page_done in files_page_done:
-                    try:
-                        data_d = read_data_from_file(path_file=f"db/Update/{file_page_done}")
-                        list_posts_page_done.extend(data_d)
-                    except:
-                        continue
-                logger.info(f"Tổng số bài viết đã done trong file page là {len(list_posts_page_done)}")
-                list_posts = list((set(list_posts_page + list_posts_group)) - set(list_posts_page_done))
-                logger.info(f"Tổng số bài viết cần crawl là {len(list_posts)}")#lấy tất cả các bài viết trong page và group
+# Giới hạn “đào lùi” theo năm (bao nhiêu năm về trước)
+STOP_AT_YEAR  = 2015  # đổi tùy ý
 
-                for data in list_posts:
-                    if data.strip() == "":
-                        continue
-                    queue_.put(data.strip())
-                logger.info(f"Tổng số bài viết cần crawl là {queue_.qsize()}")
-                if queue_.qsize() == 0:
-                    logger.warning("Không có bài viết nào cần được update tong khoảng thời gian trên")
-                    return
-                config_temp = copy.deepcopy(config)
-              
-                if int(config['mode']['num_thread']) > 1:
-                    for i in range(int(config['mode']['num_thread'])):
-                        #config_temp = config
-                        id_new = str(config['id'])  + "_" + str(i)
-                        config_temp['id'] = id_new
-                        self.start_scraper_not_login(config_temp, queue_update=queue_, time_check=time_check)#, shared_dict_3=shared_dict_3, lock_3=lock_3)
-                else:
-                    self.start_scraper_not_login(config, queue_update=queue_, time_check=time_check)#, shared_dict_3=shared_dict_3, lock_3=lock_3)
+os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
 
-                
+# =========================
+# Hook /api/graphql/
+# =========================
+def install_early_hook(driver, keep_last=KEEP_LAST):
+    HOOK_SRC = r"""
+    (function(){
+      if (window.__gqlHooked) return;
+      window.__gqlHooked = true;
+      window.__gqlReqs = [];
+      function headersToObj(h){try{
+        if (!h) return {};
+        if (h instanceof Headers){const o={}; h.forEach((v,k)=>o[k]=v); return o;}
+        if (Array.isArray(h)){const o={}; for (const [k,v] of h) o[k]=v; return o;}
+        return (typeof h==='object')?h:{};}catch(e){return {}}
+      }
+      function pushRec(rec){try{
+        const q = window.__gqlReqs; q.push(rec);
+        if (q.length > __KEEP_LAST__) q.splice(0, q.length - __KEEP_LAST__);
+      }catch(e){}}
+      const origFetch = window.fetch;
+      window.fetch = async function(input, init){
+        const url = (typeof input==='string') ? input : (input&&input.url)||'';
+        const method = (init&&init.method)||'GET';
+        const body = (init && typeof init.body==='string') ? init.body : '';
+        const hdrs = headersToObj(init && init.headers);
+        let rec = null;
+        if (url.includes('/api/graphql/') && method==='POST'){
+          rec = {kind:'fetch', url, method, headers:hdrs, body:String(body)};
+        }
+        const res = await origFetch(input, init);
+        if (rec){
+          try{ rec.responseText = await res.clone().text(); }catch(e){ rec.responseText = null; }
+          pushRec(rec);
+        }
+        return res;
+      };
+      const XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(m,u,a){ this.__m=m; this.__u=u; return XO.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function(b){
+        this.__b = (typeof b==='string')?b:'';
+        this.addEventListener('load', ()=>{
+          try{
+            if ((this.__u||'').includes('/api/graphql/') && (this.__m||'')==='POST'){
+              pushRec({kind:'xhr', url:this.__u, method:this.__m, headers:{}, body:String(this.__b),
+                       responseText:(typeof this.responseText==='string'?this.responseText:null)});
+            }
+          }catch(e){}
+        });
+        return XS.apply(this, arguments);
+      };
+    })();
+    """.replace("__KEEP_LAST__", str(keep_last))
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": HOOK_SRC})
+    driver.execute_script(HOOK_SRC)
 
-    """
-    Hàm để tạo thread chạy scraper facebook theo các mode
-    """
-    def start_scraper_not_login(self, config, **kwargs):
-        sp = ScraperThread(config, **kwargs)
-        sp.daemon = True
-        sp.start()
-        time.sleep(2)
-        self.process_scrapers[str(config["id"])] = sp
-        # if config["id"] not in self.process_scrapers:
-        #     self.process_scrapers[str(config["id"])] = sp
-        # else:
-        #     logger.warning(f"Key {str(config['id'])} đã tồn tại")
+def gql_count(d): return d.execute_script("return (window.__gqlReqs||[]).length")
+def get_gql_at(d, i): return d.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
 
-"""
-Lấy thông tin cơ bản của tất cả các post trong 1 page trong 1 khoảng thời gian nhất định hoặc số bài nhất định
-"""
+def wait_next_req(d, start_idx, matcher, timeout=25, poll=0.25):
+    end = time.time() + timeout
+    cur = start_idx
+    while time.time() < end:
+        n = gql_count(d)
+        while cur < n:
+            req = get_gql_at(d, cur)
+            if req and matcher(req): return (cur, req)
+            cur += 1
+        time.sleep(poll)
+    return None
 
-from utils.log_utils import logger
-from fb_api_wrapper.libs.fb_core import FaceApiWrapper
-from utils.common_utils import CommonUtils
-import json
-from configs.config import is_data_raw_post, SLEEP_RANDOM_GROUP
-from utils.check_utils import check_time_line_expired
-from utils.utils import read_data_from_file, write_data_to_file, write_data_raw_post, get_proxy_from_list, get_proxy, get_random_proxy
-# from utils.api_utils import get_ids_post, insert_ids_post
-from src.post import Post
-from src.parse_json_post import ParserInfoPost
-from typing import Optional, Union
-import os
-import requests
-from configs.define_api import HEADERS
-from queue import Queue
-from datetime import datetime
-from threading import Lock
-
-class ScaperPostInforPage:
-
-    """
-    Khởi tạo đối tượng ScaperPostInforPage
-    - datasets: list danh sách các page id cần lấy thông tin 
-    - PROXY: danh sách các proxy, bắt buộc phải dùng proxy khi chạy
-    - time_line: thời gian lấy bài viết
-    - MAX_SIZE_POST: số bài viết tối đa
-    - process_name: tên process
-    """
-    def __init__(
-            self, 
-            PROXY: Optional[dict] = None, 
-            PROXYS: Optional[list] = None,
-            queue_: Optional[Queue] = None,
-            datasets: Optional[list] = None,
-            MAX_SIZE_POST: Optional[int]=1000, 
-            time_line: Optional[datetime]=None, 
-            process_name: Optional[str]="", 
-            lock: Optional[Lock] = None
-        ) -> None:
-        self.queue_ = queue_
-        self.datasets = datasets
-        self.PROXY = PROXY
-        self.PROXYS = PROXYS
-        self.MAX_SIZE_POST = MAX_SIZE_POST
-        self.process_name = process_name
-        self.time_line = time_line
-        self.idem = 0
-        self.bCheck = True
-        self.iLinkDuplicate = 0
-        self.check_time_expired = False
-        self.lock = lock
-        self.page_backup = self.__load_data_backup()
-        self.SESSION = None
-        self.proxy_use = None
-        #self.tenancy_id = []
-        self.__create_session()
-
-    def __create_session(self):
-        logger.info(f"Process {self.process_name} >> Create session")
-        self.SESSION = requests.Session()
-        if self.PROXYS:
-            #self.proxy_use = get_proxy_from_list(self.PROXYS)
-            self.proxy_use = get_random_proxy(self.PROXYS)
-        else:
-            #self.proxy_use = get_proxy(self.PROXY)
-            self.proxy_use = self.PROXY
-        self.SESSION.headers.update(HEADERS)
-        if self.proxy_use:
-            self.SESSION.proxies.update(self.proxy_use)
-   
-    def __reset_params(self):
-        self.idem = 0
-        self.bCheck = True
-        self.iLinkDuplicate = 0
-        self.check_time_expired = False
-    def __processing_data(self, node_posts: Optional[list], page_id: Union[str, int], link_posts_all: Optional[list]):
-        page_id = str(page_id)
-        for _p in node_posts:
-            try:
-                post_id = _p['post_id']
-                #lấy thông tin cơ bản của bài viết
-                post = Post(id=post_id, parent_id=page_id, type="facebook page")
-                info_post = ParserInfoPost(post=post, path_file=f"db/Pages/{page_id}/{page_id}_info.json", id_topic=0)
-                info_post.extract(jsondata=_p)
-                author_id = post.author_id
-            
-                self.idem += 1
-                ## lấy thời gian bài post 
-                create_time_post = post.created_time
-                if is_data_raw_post:
-                    write_data_raw_post(path_file=f"db/Pages/{page_id}/{page_id}_{author_id}_{post_id}.txt", data=json.dumps(_p))
-                
-                logger.info(f"Process {self.process_name} >> Time create post {post_id} {create_time_post}")
-                if self.time_line is not None:
-                    if check_time_line_expired(create_time_post, self.time_line):
-                        logger.warning(f"Process {self.process_name} >> Thời gian bài đăng đã quá {self.time_line}")
-                        self.check_time_expired =  True
-                        break
-
-                #data_link ="facebook page" + "|" + page_id + "|" + author_id + "|" + post_id
-                data_link = f"facebook page|{page_id}|{post.id_encode}|{post_id}"
-                logger.info(data_link)
-                if data_link in link_posts_all:
-                    logger.info(f"Process {self.process_name} >> id post đã có trong db {data_link}")
-                    self.iLinkDuplicate += 1
-                    continue 
-                else:
-                    self.iLinkDuplicate = 0
-                    write_data_to_file(path_file=f"db/Pages/{page_id}.txt", message=str(data_link))
-                    ## Comment lại để test
-                    #insert_ids_post(ids=[str(data_link)], table_name="facebook_page", object_id=str(page_id))
-                            
-                del info_post
-                del post
-            except Exception as ex:
-                logger.warning(f"Process {self.process_name} >> Error func __processing_data: {ex}")
-    def __check_done(self):
-        if self.iLinkDuplicate >= 3:
-            logger.warning(f"Process {self.process_name} >> Tất cả bài viết trong page, page đã trùng")
-            self.bCheck = False
-        if self.check_time_expired:
-            if self.time_line:
-                logger.warning(f"Process {self.process_name} >> Tất cả bài viết trong page đã quá thời gian {self.time_line}")
-                self.bCheck = False
-        if self.idem > self.MAX_SIZE_POST and self.MAX_SIZE_POST != -1:
-            logger.warning(f"Process {self.process_name} >> Đã lấy đủ số lượng bài ưu cầu")
-            self.bCheck = False
-
-    def __scaper_page(self, page_id: Union[str, int], link_posts_all: Optional[list]):
+# =========================
+# Chrome attach qua remote debugging
+# =========================
+def _wait_port(host: str, port: int, timeout: float = 20.0, poll: float = 0.1) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
         try:
-            self.__reset_params()
-            
-            posts_generator = FaceApiWrapper.get_node_posts_page(page_id=page_id, session=self.SESSION, post_limit=self.MAX_SIZE_POST)
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except Exception:
+            time.sleep(poll)
+    return False
 
-            for node_posts in posts_generator:
-                self.__processing_data(node_posts=node_posts, page_id=page_id, link_posts_all=link_posts_all)
-                self.__check_done()
-                if not self.bCheck:
-                    break
-            del posts_generator
-            logger.info(f"Process {self.process_name} >> Scraper done group {page_id}, number post {self.idem}")
-                  
-            # if self.idem == 0:
-            #     with open(f"db/Groups/{group_id}_noposst.txt", "w", encoding="utf-8") as fp:
-            #         fp.write(group_id)
+def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver.Chrome:
+    chrome_opts = Options()
+    if headless:
+        chrome_opts.add_argument("--headless=new")
+        chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--window-size=1920,1080")
+    chrome_opts.add_argument("--disable-extensions")
+    chrome_opts.add_argument("--disable-background-networking")
+    chrome_opts.add_argument("--disable-popup-blocking")
+    chrome_opts.add_argument("--no-first-run")
+    chrome_opts.add_argument("--no-default-browser-check")
+
+    sw_options = None
+    if proxy_url:
+        sw_options = {
+            "proxy": {
+                "http":  proxy_url,
+                "https": proxy_url,
+                "no_proxy": "localhost,127.0.0.1",
+            },
+            # "verify_ssl": False,  # nếu proxy self-signed
+        }
+
+    driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
+    driver.scopes = ['.*']  # hook all; có thể thu hẹp sau
+    return driver
+# =========================
+# (Optional) bootstrap_auth — nạp cookies/localStorage nếu có
+# =========================
+def bootstrap_auth(d):
+    if COOKIES_PATH and os.path.exists(COOKIES_PATH):
+        try:
+            d.get("https://www.facebook.com/")
+            with open(COOKIES_PATH, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+            for c in cookies:
+                cookie = {k: c[k] for k in ("name","value","domain","path","secure","httpOnly","expiry") if k in c}
+                if "expiry" in cookie and "expires" not in cookie:
+                    cookie["expires"] = cookie.pop("expiry")
+                d.add_cookie(cookie)
+            d.get("https://www.facebook.com/")
         except Exception as e:
-            logger.error(f"Process {self.process_name} >> Error func scaper_group: {e}")
+            print("[WARN] bootstrap cookies:", e)
 
-    def __load_data_backup(self):
+    if LOCALSTORAGE_PATH and os.path.exists(LOCALSTORAGE_PATH):
         try:
-            return read_data_from_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt")
-        except:
-            return []
-        
-    def run_error_page(self):
+            d.get("https://www.facebook.com/")
+            with open(LOCALSTORAGE_PATH, "r", encoding="utf-8") as f:
+                kv = json.load(f)
+            for k,v in kv.items():
+                d.execute_script("localStorage.setItem(arguments[0], arguments[1]);", k, v)
+            d.get("https://www.facebook.com/")
+        except Exception as e:
+            print("[WARN] bootstrap localStorage:", e)
+
+# =========================
+# Request matching / parsing
+# =========================
+def parse_form(body_str: str) -> Dict[str, str]:
+    qs = urllib.parse.parse_qs(body_str, keep_blank_values=True)
+    return {k: (v[0] if isinstance(v, list) else v) for k, v in qs.items()}
+
+def is_group_feed_req(rec):
+    if "/api/graphql/" not in (rec.get("url") or ""): return False
+    if (rec.get("method") or "").upper() != "POST": return False
+    body = rec.get("body") or ""
+    if "fb_api_req_friendly_name=" in body:
+        if re.search(r"(?:GroupComet|CometGroup|GroupsComet|ProfileComet|Comet).*?(?:Feed|Timeline|Stories).*?(?:Pagination|Refetch)", body, re.I):
+            return True
+    try:
+        v = parse_form(body).get("variables","")
+        vj = json.loads(urllib.parse.unquote_plus(v))
+        if any(k in vj for k in ["groupID","groupIDV2","id","actorID","profileID","pageID"]):
+            if any(k in vj for k in ["after","cursor","endCursor","afterCursor","feedAfterCursor","beforeTime","afterTime"]):
+                return True
+    except:
+        pass
+    return False
+
+def _strip_xssi_prefix(s: str) -> str:
+    if not s: return s
+    s2 = s.lstrip()
+    s2 = re.sub(r'^\s*for\s*\(\s*;\s*;\s*\)\s*;\s*', '', s2)
+    s2 = re.sub(r"^\s*\)\]\}'\s*", '', s2)
+    return s2
+
+def iter_json_values(s: str):
+    dec = json.JSONDecoder()
+    i, n = 0, len(s)
+    while i < n:
+        m = re.search(r'\S', s[i:])
+        if not m: break
+        j = i + m.start()
         try:
-            pages_id_error = list(set(read_data_from_file(path_file=f"db/Pages/page_error_{self.process_name}.txt")))
-            logger.warning(f"Process {self.process_name} >> Số page lỗi cần chạy lại là {len(pages_id_error)}")
-            for page_ in pages_id_error:
-                # try:
-                #     link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_}.txt")))
-                # except Exception as ex:
-                #     logger.warning(ex)
-                #     link_posts_all = []
-                #link_posts_all = get_ids_post(table_name="facebook_page", object_id=str(page_))
-                try:
-                    link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_}.txt")))
-                except Exception as ex:
-                    logger.warning(ex)
-                    link_posts_all = []
-                self.__scaper_page(page_, link_posts_all)
-                CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
+            obj, k = dec.raw_decode(s, j); yield obj; i = k
+        except json.JSONDecodeError:
+            chunk = _strip_xssi_prefix(s[j:])
+            if chunk == s[j:]: break
             try:
-                logger.info(f"Process {self.process_name} >> Remove err_file")
-                os.remove(f"db/Pages/page_error_{self.process_name}.txt")
-            except:
-                pass  
-        except Exception as ex:
-            logger.warning(ex)
+                obj, k_rel = dec.raw_decode(chunk, 0); yield obj; i = j + k_rel
+            except json.JSONDecodeError:
+                break
 
-    def start_scraper_with_datasets(self):
-        logger.info(f"Process {self.process_name} >> Số Page có trong dataset là: {len(self.datasets)}")
+def choose_best_graphql_obj(objs):
+    objs = list(objs)
+    if not objs: return None
+    with_data = [o for o in objs if isinstance(o, dict) and 'data' in o]
+    pick = with_data or objs
+    return max(pick, key=lambda o: len(json.dumps(o, ensure_ascii=False)))
 
-        for index, page_id in enumerate(self.datasets):
-            page_id = str(page_id)
+# =========================
+# Cursor / HasNext / Time helpers
+# =========================
+CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
 
-            if str(page_id) in self.page_backup:
-                logger.warning(f"Process {self.process_name} >> Page {page_id} đã được crawl trong job hiện tại. Next page")
-                continue
-            self.page_backup.append(str(page_id))
-            logger.info(f"Process {self.process_name} >> Scaper page {page_id}")
-            #try:
-                #link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_id}.txt")))
-                
-            # except Exception as ex:
-            #     logger.warning(ex)
-            #     link_posts_all = []
-            #link_posts_all = get_ids_post(table_name="facebook_page", object_id=str(page_id))
-            try:
-                link_posts_all = list(set(read_data_from_file(path_file=f"db/Pages/{page_id}.txt")))
-            except Exception as ex:
-                logger.warning(ex)
-                link_posts_all = []
-            path_data = f"db/Pages/{page_id}"
-            if not os.path.exists(path_data):
-                os.makedirs(path_data)
-            self.__scaper_page(page_id, link_posts_all)
-            write_data_to_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt", message=str(page_id))
-            CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
+def deep_collect_cursors(obj):
+    found = []
+    def dive(o):
+        if isinstance(o, dict):
+            pi = o.get("page_info") or o.get("pageInfo")
+            if isinstance(pi, dict):
+                ec = pi.get("end_cursor") or pi.get("endCursor")
+                if isinstance(ec, str) and len(ec) >= 10:
+                    found.append(("page_info.end_cursor", ec))
+            edges = o.get("edges")
+            if isinstance(edges, list) and edges:
+                last = edges[-1]
+                if isinstance(last, dict):
+                    cur = last.get("cursor")
+                    if isinstance(cur, str) and len(cur) >= 10:
+                        found.append(("edges[-1].cursor", cur))
+            for k, v in o.items():
+                if k in CURSOR_KEYS and isinstance(v, str) and len(v) >= 10:
+                    found.append((k, v))
+                dive(v)
+        elif isinstance(o, list):
+            for v in o: dive(v)
+    dive(obj)
+    priority = {"page_info.end_cursor": 3, "end_cursor": 3, "endCursor": 3, "edges[-1].cursor": 2}
+    found.sort(key=lambda kv: (priority.get(kv[0], 1), len(kv[1])), reverse=True)
+    uniq, seenv = [], set()
+    for k, v in found:
+        if v not in seenv:
+            uniq.append((k, v)); seenv.add(v)
+    return uniq
+
+def deep_find_has_next(obj):
+    res = []
+    def dive(o):
+        if isinstance(o, dict):
+            pi = o.get("page_info") or o.get("pageInfo")
+            if isinstance(pi, dict):
+                hn = pi.get("has_next_page");  hn = pi.get("hasNextPage") if hn is None else hn
+                if isinstance(hn, bool): res.append(hn)
+            for v in o.values(): dive(v)
+        elif isinstance(o, list):
+            for v in o: dive(v)
+    dive(obj)
+    if any(res): return True
+    if res and not any(res): return False
+    return None
+
+def deep_collect_timestamps(obj) -> List[int]:
+    keys_hint = {"creation_time","created_time","creationTime","createdTime"}
+    out = []
+    def as_epoch_s(x):
         try:
-            logger.info(f"Process {self.process_name} >> Remove backup_file")
-            os.remove(f"db/Pages/backup_page_{self.process_name}.txt")
-        except:
-            pass  
-        self.run_error_page()
-    def start_scraper_with_queue(self):
-        while not self.queue_.empty():
-            try:
-                logger.info(f"Process {self.process_name} >> Size of queue {self.queue_.qsize()}")
+            v = int(x)
+            if v > 10_000_000_000: v //= 1000
+            if 1104537600 <= v <= 4102444800:  # 2005..2100
+                return v
+        except: pass
+        return None
+    def dive(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in keys_hint:
+                    vv = as_epoch_s(v)
+                    if vv: out.append(vv)
+                dive(v)
+        elif isinstance(o, list):
+            for v in o: dive(v)
+    dive(obj)
+    return out
 
-                page_id = self.queue_.get()
-                # page_id = data['id']
-                # self.tenancy_id = data['tenancy_id']
-                if str(page_id) in self.page_backup:
-                    logger.warning(f"Process {self.process_name} >> Page {page_id} đã được crawl trong job hiện tại. Next page")
-                    continue
-                self.page_backup.append(str(page_id))
-                logger.info(f"Process {self.process_name} >> Scaper page {page_id}")
-                link_posts_all = [] #get_ids_post(table_name="facebook_page", object_id=str(page_id))
-                path_data = f"db/Pages/{page_id}"
-                if not os.path.exists(path_data):
-                    os.makedirs(path_data)
-                self.__scaper_page(page_id, link_posts_all)
-                write_data_to_file(path_file=f"db/Pages/backup_page_{self.process_name}.txt", message=str(page_id))
-                CommonUtils.sleep_random_in_range(SLEEP_RANDOM_GROUP[0], SLEEP_RANDOM_GROUP[1])
-                try:
-                    logger.info(f"Process {self.process_name} >> Remove backup_file")
-                    os.remove(f"db/Pages/backup_page_{self.process_name}.txt")
-                except:
-                    pass  
-                self.run_error_page()
+# =========================
+# Variables template helpers
+# =========================
+def get_vars_from_form(form_dict):
+    try:
+        return json.loads(form_dict.get("variables", "{}")) if form_dict else {}
+    except:
+        return {}
 
-            except Exception as ex:
-                logger.error(f"Process {self.process_name} >> Error func start_with_queue {ex}")
-    def start_scraper(self):
-        # if self.proxy_use is None:
-        #     logger.critical(f"Process {self.process_name} >> Tool cần proxy để chạy...")
-        #     return
-        logger.info(f"Process {self.process_name} >> Start scraper with proxy {self.proxy_use}")
-        if self.datasets:
-            self.start_scraper_with_datasets()
-        elif self.queue_:
-            self.start_scraper_with_queue()
+def make_vars_template(vars_dict):
+    if not isinstance(vars_dict, dict): return {}
+    t = dict(vars_dict)
+    for k in list(t.keys()):
+        if k in CURSOR_KEYS: del t[k]
+    return t
+
+def merge_vars(base_vars, template_vars):
+    if not isinstance(base_vars, dict): base_vars = {}
+    if not isinstance(template_vars, dict): template_vars = {}
+    out = dict(base_vars)
+    for k, v in template_vars.items():
+        if k in CURSOR_KEYS: continue
+        out[k] = v
+    return out
+
+def strip_cursors_from_vars(v: dict) -> dict:
+    if not isinstance(v, dict): return {}
+    return {k: v for k, v in v.items() if k not in CURSOR_KEYS}
+
+def update_vars_for_next_cursor(form: dict, next_cursor: str, vars_template: dict = None):
+    try:
+        base = json.loads(form.get("variables", "{}"))
+    except Exception:
+        base = {}
+    if vars_template:
+        base = merge_vars(base, vars_template)
+    changed = False
+    if "cursor" in base:
+        base["cursor"] = next_cursor; changed = True
+    if not changed:
+        for key in ["after","endCursor","afterCursor","feedAfterCursor"]:
+            if key in base:
+                base[key] = next_cursor; changed = True
+    if not changed:
+        base["cursor"] = next_cursor
+    if "count" in base and isinstance(base["count"], int):
+        base["count"] = max(base["count"], 10)
+    form["variables"] = json.dumps(base, separators=(",", ":"))
+    return form
+
+def set_time_window_on_form(form: dict, t_from: Optional[int], t_to: Optional[int], vars_template: dict) -> dict:
+    """
+    Gắn beforeTime/afterTime nếu tồn tại trong template (hoặc cứ thêm, GraphQL sẽ bỏ qua nếu không hỗ trợ).
+    - afterTime: epoch giây (>=)
+    - beforeTime: epoch giây (<)
+    """
+    try:
+        base = json.loads(form.get("variables", "{}"))
+    except Exception:
+        base = {}
+    base = merge_vars(base, vars_template)
+    known_keys = set(base.keys())
+    cand_after = "afterTime"  if "afterTime"  in known_keys else "after_time"
+    cand_before= "beforeTime" if "beforeTime" in known_keys else "before_time"
+    if t_from is not None:  base[cand_after]  = int(t_from)
+    if t_to   is not None:  base[cand_before] = int(t_to)
+    if "count" in base and isinstance(base["count"], int):
+        base["count"] = max(base["count"], 10)
+    form2 = dict(form)
+    form2["variables"] = json.dumps(base, separators=(",", ":"))
+    return form2
+
+# =========================
+# Post collectors (tối giản, ưu tiên rid + link + created_time)
+# =========================
+POST_URL_RE = re.compile(
+    r"""https?://(?:web\.)?facebook\.com/
+        (?:
+            groups/[^/]+/(?:permalink|posts)/\d+
+          | [A-Za-z0-9.\-]+/posts/\d+
+          | [A-Za-z0-9.\-]+/reel/\d+
+          | photo(?:\.php)?\?(?:.*(?:fbid|story_fbid|video_id)=\d+)
+          | .*?/pfbid[A-Za-z0-9]+
+        )
+    """, re.I | re.X
+)
+
+def _is_story_node(n: dict) -> bool:
+    if n.get("__typename") == "Story": return True
+    if n.get("__isFeedUnit") == "Story": return True
+    if "post_id" in n or "comet_sections" in n: return True
+    return False
+
+def _looks_like_group_post(n: dict) -> bool:
+    if not _is_story_node(n): return False
+    url = n.get("wwwURL") or n.get("url") or ""
+    pid = n.get("id") or ""
+    if POST_URL_RE.match(url): return True
+    if (isinstance(pid, str) and pid.startswith("Uzpf")) or n.get("post_id"): return True
+    return False
+
+def _extract_url_digits(url: str) -> Optional[str]:
+    if not url: return None
+    try:
+        path = urlparse(url).path.lower()
+    except:
+        path = url.lower()
+    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
+    if m: return m.group(1)
+    qs = parse_qs(urlparse(url).query)
+    for k in ("fbid","story_fbid","video_id","photo_id","id","v"):
+        v = qs.get(k)
+        if v and v[0] and v[0].isdigit():
+            return v[0]
+    return None
+
+def collect_post_summaries(obj, out, group_url=GROUP_URL):
+    if isinstance(obj, dict):
+        if _looks_like_group_post(obj):
+            post_id_api = obj.get("post_id")
+            fb_id      = obj.get("id")
+            url        = obj.get("wwwURL") or obj.get("url")
+            url_digits = _extract_url_digits(url)
+            rid        = post_id_api or url_digits or fb_id
+            created_candidates = deep_collect_timestamps(obj)
+            created = max(created_candidates) if created_candidates else None
+            out.append({
+                "id": fb_id,
+                "rid": rid,
+                "link": url,
+                "created_time": created,
+            })
+        for v in obj.values():
+            collect_post_summaries(v, out, group_url)
+    elif isinstance(obj, list):
+        for v in obj:
+            collect_post_summaries(v, out, group_url)
+
+def filter_only_feed_posts(items):
+    keep = []
+    for it in items or []:
+        link = (it.get("link") or "").strip()
+        fb_id = (it.get("id") or "").strip()
+        rid = (it.get("rid") or "").strip()
+        if rid or (link and POST_URL_RE.match(link)) or (fb_id and fb_id.startswith("Uzpf")):
+            keep.append(it)
+    return keep
+
+# =========================
+# Dedupe/merge (rid + normalized link)
+# =========================
+def _norm_link(u: str) -> Optional[str]:
+    if not u or not isinstance(u, str):
+        return None
+    try:
+        p = urlparse(u)
+        host = p.netloc.lower()
+        if host.endswith("facebook.com"): host = "facebook.com"
+        path = (p.path or "").rstrip("/")
+        if re.search(r"/(?:reel|posts|permalink)/\d+$", path.lower()):
+            return urlunparse(("https", host, path.lower(), "", "", ""))
+        return None
+    except Exception:
+        return None
+
+def _best_primary_key(it: dict) -> Optional[str]:
+    rid = it.get("rid"); link = it.get("link"); _id = it.get("id")
+    digits = _extract_url_digits(link) if link else None
+    norm   = _norm_link(link) if link else None
+    for k in (rid, _id, digits, norm):
+        if isinstance(k, str) and k.strip(): return k.strip()
+    return None
+
+def _all_join_keys(it: dict) -> List[str]:
+    keys, seen = [], set()
+    for k in (it.get("rid"), it.get("id"), _extract_url_digits(it.get("link") or ""), _norm_link(it.get("link") or "")):
+        if isinstance(k, str) and k and (k not in seen):
+            keys.append(k); seen.add(k)
+    return keys
+
+def merge_two_posts(a: dict, b: dict) -> dict:
+    if not a: return b or {}
+    if not b: return a or {}
+    m = dict(a)
+    m["id"]   = m.get("id")   or b.get("id")
+    m["rid"]  = m.get("rid")  or b.get("rid")
+    m["link"] = m.get("link") or b.get("link")
+    ca, cb = m.get("created_time"), b.get("created_time")
+    try:
+        m["created_time"] = max(int(ca) if ca else 0, int(cb) if cb else 0) or (ca or cb)
+    except: m["created_time"] = ca or cb
+    return m
+
+def coalesce_posts(items: List[dict]) -> List[dict]:
+    groups, key2group, seq = {}, {}, 0
+    def _new_gid():
+        nonlocal seq; seq += 1; return f"g{seq}"
+    for it in (items or []):
+        keys = _all_join_keys(it)
+        gid = None
+        for k in keys:
+            if k in key2group:
+                gid = key2group[k]; break
+        if gid is None:
+            gid = _new_gid(); groups[gid] = it
         else:
-            logger.warning(f"Process {self.process_name} >> Không có data update")
-# hiện tại code trên đang sử dụng thư viện fb_api_wrapper để crawler dữ liệu bài viết mà đang không có checkpoint bằng cursor, tôi muốn 
+            groups[gid] = merge_two_posts(groups[gid], it)
+        for k in _all_join_keys(groups[gid]):
+            key2group[k] = gid
+    return list(groups.values())
+
+# =========================
+# JS fetch with page cookies
+# =========================
+def js_fetch_in_page(driver, form_dict, extra_headers=None):
+    script = """
+    const url = "/api/graphql/";
+    const form = arguments[0];
+    const extra = arguments[1] || {};
+    const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
+    const body = new URLSearchParams(form).toString();
+    return fetch(url, {method:"POST", headers, body, credentials:"include"}).then(r=>r.text());
+    """
+    return driver.execute_script(script, form_dict, extra_headers or {})
+
+# =========================
+# Soft-refetch & reload
+# =========================
+def soft_refetch_form_and_cursor(driver, form, vars_template):
+    try:
+        base = json.loads(form.get("variables", "{}"))
+    except Exception:
+        base = {}
+    base = merge_vars(base, vars_template)
+    base = strip_cursors_from_vars(base)
+    new_form = dict(form)
+    new_form["variables"] = json.dumps(base, separators=(",", ":"))
+    txt = js_fetch_in_page(driver, new_form, extra_headers={})
+    obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+    if not obj: return None, None, None, None
+    cursors = deep_collect_cursors(obj)
+    new_has_next = deep_find_has_next(obj)
+    if new_has_next is None: new_has_next = bool(cursors)
+    new_cursor = cursors[0][1] if cursors else None
+    return new_form, new_cursor, new_has_next, obj
+
+def reload_and_refresh_form(d, group_url, cursor, vars_template, timeout=25, poll=0.25):
+    d.get(group_url); time.sleep(1.5)
+    for _ in range(4):
+        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));"); time.sleep(0.5)
+    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=timeout, poll=poll)
+    if not nxt: return None, None, None
+    _, req = nxt
+    new_form = parse_form(req.get("body", ""))
+    friendly = urllib.parse.parse_qs(req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
+    new_doc_id = new_form.get("doc_id")
+    if cursor: new_form = update_vars_for_next_cursor(new_form, cursor, vars_template)
+    return new_form, friendly, new_doc_id
+
+# =========================
+# Checkpoint / Output
+# =========================
+def load_checkpoint():
+    if not os.path.exists(CHECKPOINT):
+        return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
+                "slice_to": None, "slice_from": None, "year": None, "mode": None,
+                "page": None, "min_created": None}
+    try:
+        with open(CHECKPOINT, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
+                "slice_to": None, "slice_from": None, "year": None, "mode": None,
+                "page": None, "min_created": None}
+
+def save_checkpoint(**kw):
+    data = load_checkpoint()
+    data.update(kw)
+    data["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
+    with open(CHECKPOINT, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def append_ndjson(items):
+    if not items: return
+    with open(OUT_NDJSON, "a", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+def normalize_seen_ids(seen_ids):
+    return set(seen_ids or [])
+
+# =========================
+# Paginate 1 cửa sổ thời gian (optional t_from/t_to) + CHECKPOINT REALTIME
+# =========================
+def paginate_window(d, form, vars_template, seen_ids: set,
+                    t_from: Optional[int]=None, t_to: Optional[int]=None,
+                    page_limit: Optional[int]=None) -> Tuple[int, Optional[int], bool]:
+    """
+    Chạy paginate trong khoảng thời gian [t_from, t_to) nếu cung cấp.
+    Trả về:
+      - total_new viết ra
+      - min_created_time bắt gặp (để dùng làm mốc beforeTime tiếp)
+      - có còn has_next trong cửa sổ này không
+    """
+    total_new = 0
+    min_created = None
+    no_progress_rounds = 0
+
+    mode_str = "time" if (t_from is not None or t_to is not None) else "warmup"
+    if mode_str == "time":
+        print(f"[MODE] Time-slice window: from={t_from} to={t_to}")
+
+    # nếu có cửa sổ thời gian → ghim vào variables trước
+    if (t_from is not None) or (t_to is not None):
+        form = set_time_window_on_form(form, t_from, t_to, vars_template)
+
+    page = 0
+    while True:
+        page += 1
+        txt = js_fetch_in_page(d, form, extra_headers={})
+        obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+        with open(os.path.join(RAW_DUMPS_DIR, f"slice_{t_from or 'None'}_{t_to or 'None'}_p{page}.json"), "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+
+        if not obj:
+            print(f"[SLICE {t_from}->{t_to}] parse fail → stop slice.")
+            break
+
+        page_posts = []
+        collect_post_summaries(obj, page_posts)
+        page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
+
+        # fresh by PK
+        written_this_round = set()
+        fresh = []
+        for p in page_posts:
+            pk = _best_primary_key(p)
+            if pk and (pk not in seen_ids) and (pk not in written_this_round):
+                fresh.append(p); written_this_round.add(pk)
+
+        if fresh:
+            append_ndjson(fresh)
+            for p in fresh:
+                for k in _all_join_keys(p): seen_ids.add(k)
+            total_new += len(fresh)
+            no_progress_rounds = 0
+        else:
+            no_progress_rounds += 1
+
+        # cập nhật min_created_time
+        for p in page_posts:
+            ct = p.get("created_time")
+            if isinstance(ct, int):
+                if (min_created is None) or (ct < min_created):
+                    min_created = ct
+
+        # cursor / next
+        cursors = deep_collect_cursors(obj)
+        has_next = deep_find_has_next(obj)
+        if has_next is None: has_next = bool(cursors)
+        new_cursor = cursors[0][1] if cursors else None
+
+        print(f"[SLICE {t_from or '-inf'}→{t_to or '+inf'}] p{page} got {len(page_posts)} (new {len(fresh)}), total_new={total_new}, next={has_next}")
+
+        # 🔸 CHECKPOINT REALTIME mỗi page
+        save_checkpoint(
+            cursor=new_cursor,
+            seen_ids=list(seen_ids),
+            vars_template=vars_template,
+            mode=mode_str,
+            slice_from=t_from,
+            slice_to=t_to,
+            year=(datetime.datetime.utcfromtimestamp(t_to).year
+                  if (t_to and mode_str == "time") else None),
+            page=page,
+            min_created=min_created
+        )
+
+        if not has_next or (page_limit and page >= page_limit):
+            # hết trang trong slice hiện tại → thử soft-refetch để "nạp" doc khác
+            if no_progress_rounds >= 2:
+                new_form, boot_cursor, boot_has_next, _ = soft_refetch_form_and_cursor(d, form, vars_template)
+                if new_form and (boot_cursor or boot_has_next):
+                    form = new_form
+                    if (t_from is not None) or (t_to is not None):
+                        form = set_time_window_on_form(form, t_from, t_to, vars_template)
+                    no_progress_rounds = 0
+                    continue
+            break
+
+        # có next: tiếp
+        if new_cursor:
+            form = update_vars_for_next_cursor(form, new_cursor, vars_template)
+
+        time.sleep(random.uniform(0.7, 1.4))
+
+    return total_new, min_created, bool(has_next)
+
+# =========================
+# Year-by-year runner (có checkpoint)
+# =========================
+def run_year_by_year(d, boot_form, vars_template, seen_ids):
+    """
+    Chạy vét theo từng năm:
+    - Khởi điểm: slice warmup (không khóa thời gian) để lấy min_created.
+    - Sau đó "đào lùi": đặt beforeTime = min_created hiện có (hoặc mốc cuối năm) và lặp.
+    - Khi chạm năm < STOP_AT_YEAR thì dừng.
+    """
+    total_all = 0
+
+    print("[YEAR] Warmup slice (no time window)...")
+    new_warm, min_ct, _ = paginate_window(d, boot_form, vars_template, seen_ids, None, None)
+    total_all += new_warm
+    if not min_ct:
+        print("[YEAR] Không nhặt được created_time — chuyển sang paginate bình thường.")
+        return total_all
+
+    cur_to = min_ct  # exclusive
+    while True:
+        year = datetime.datetime.utcfromtimestamp(cur_to).year
+        if year < STOP_AT_YEAR:
+            print(f"[YEAR] Hit STOP_AT_YEAR={STOP_AT_YEAR}. Done.")
+            break
+
+        start_of_year = int(datetime.datetime(year, 1, 1, 0, 0, 0).timestamp())
+        print(f"[YEAR] >>> year {year}: slice {start_of_year} → {cur_to}")
+
+        # 🔸 Save checkpoint trước khi vào slice năm
+        save_checkpoint(
+            cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+            mode="time", slice_from=start_of_year, slice_to=cur_to, year=year,
+            page=0, min_created=None
+        )
+
+        # Hard reload form để refresh doc_id/tokens theo năm mới
+        form2, friendly, docid = reload_and_refresh_form(d, GROUP_URL, None, vars_template)
+        if not form2:
+            print("[YEAR] reload form fail, dùng form cũ.")
+            form2 = boot_form
+
+        added, min_ct2, _ = paginate_window(d, form2, vars_template, seen_ids,
+                                            t_from=start_of_year, t_to=cur_to)
+        total_all += added
+
+        # Cập nhật “đào lùi”: nếu trong năm còn min_ct2 thì dồn tiếp xuống < min_ct2
+        if min_ct2 and min_ct2 < cur_to:
+            cur_to = min_ct2
+        else:
+            # Hết năm này → chuyển sang năm trước (đặt cur_to = đầu năm)
+            cur_to = start_of_year
+
+        # 🔸 Checkpoint sau slice năm
+        save_checkpoint(
+            cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+            mode="time", slice_from=start_of_year, slice_to=cur_to, year=year
+        )
+
+        time.sleep(random.uniform(1.0, 2.0))
+
+    # 🔸 Clear mode khi xong
+    save_checkpoint(
+        cursor=None, seen_ids=list(seen_ids), vars_template=vars_template,
+        mode=None, slice_from=None, slice_to=None, year=None
+    )
+    return total_all
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    bootstrap_auth(d)  # nếu có file cookies/localStorage thì nạp; còn không sẽ bỏ qua
+
+    try:
+        install_early_hook(d, keep_last=KEEP_LAST)
+    except Exception as e:
+        print("[WARN] install_early_hook:", e)
+
+    d.get(GROUP_URL); time.sleep(1.2)
+    for _ in range(6):
+        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));"); time.sleep(0.6)
+
+    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=25, poll=0.25)
+    if not nxt:
+        raise RuntimeError("Không bắt được request feed. Hãy cuộn thêm/kiểm tra quyền.")
+    _, first_req = nxt
+    form         = parse_form(first_req.get("body", ""))
+    friendly     = urllib.parse.parse_qs(first_req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
+    vars_now     = get_vars_from_form(form)
+    template_now = make_vars_template(vars_now)
+
+    state = load_checkpoint()
+    seen_ids      = normalize_seen_ids(state.get("seen_ids"))
+    cursor        = state.get("cursor")
+    vars_template = state.get("vars_template") or template_now
+    mode          = state.get("mode")
+    slice_from    = state.get("slice_from")
+    slice_to      = state.get("slice_to")
+    resume_year   = state.get("year")
+
+    effective_template = vars_template or template_now
+
+    # Nếu có cursor trong checkpoint → bơm vào form
+    if cursor:
+        print(f"[RESUME] cursor={str(cursor)[:24]}..., friendly={friendly}")
+        form = update_vars_for_next_cursor(form, cursor, vars_template=effective_template)
+
+    # Nếu checkpoint đang ở time-slice → set lại cửa sổ thời gian trước khi chạy
+    if mode == "time" and (slice_from is not None or slice_to is not None):
+        print(f"[RESUME] Time-slice resume: from={slice_from}, to={slice_to}, year={resume_year}")
+        form = set_time_window_on_form(form, slice_from, slice_to, effective_template)
+
+    total_got = run_year_by_year(d, form, effective_template, seen_ids)
+
+    save_checkpoint(cursor=None, seen_ids=list(seen_ids), vars_template=effective_template)
+    print(f"[DONE] total new written (year-by-year) = {total_got} → {OUT_NDJSON}")

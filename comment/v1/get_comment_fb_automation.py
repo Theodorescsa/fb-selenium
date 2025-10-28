@@ -1,8 +1,9 @@
-import json, time, urllib.parse, subprocess, re
+import json, time, urllib.parse, subprocess, re, socket
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 
+from extract_comment_utils import extract_full_posts_from_resptext
 from get_comment_fb_utils import set_sort_to_all_comments
 
 # =========================
@@ -17,18 +18,105 @@ OUT_FILE      = "comments_batch1.json"
 # =========================
 # Boot & Hooks
 # =========================
-def start_driver(chrome_path, user_data_dir, profile_name, port=9222):
-    subprocess.Popen([
+def _wait_port(host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
+    """Return True if (host,port) becomes connectable within timeout."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except Exception:
+            time.sleep(poll)
+    return False
+
+def start_driver(chrome_path,
+                 user_data_dir,
+                 profile_name,
+                 port=9222,
+                 headless: bool = False,
+                 timeout: float = 15.0):
+    """
+    Start a real Chrome process and attach Selenium via remote debugging.
+
+    Args:
+        chrome_path: path to chrome/chromium executable.
+        user_data_dir: profile dir (keeps cookies/session).
+        profile_name: profile directory name (e.g. 'Default' or 'Profile 1').
+        port: remote debugging port.
+        headless: if True, start Chrome in headless (background) mode.
+        timeout: seconds to wait for remote port to become available.
+
+    Returns:
+        webdriver.Chrome instance (connected to the launched Chrome).
+    """
+    # build CLI args for Chrome instance
+    # keep remote-debugging-port + user profile. Add headless flags optionally.
+    args = [
         chrome_path,
         f'--remote-debugging-port={port}',
         f'--user-data-dir={user_data_dir}',
-        f'--profile-directory={profile_name}'
-    ])
-    time.sleep(2)
+        f'--profile-directory={profile_name}',
+        # useful flags to make an isolated, stable environment:
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-popup-blocking',
+        '--disable-default-apps',
+        '--disable-infobars'
+    ]
+
+    if headless:
+        # prefer new headless mode; adjust window size
+        args += [
+            '--headless=new',
+            '--disable-gpu',
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--window-size=1920,1080'
+        ]
+
+    # Launch Chrome (separate process) that Selenium will attach to.
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Wait for remote debugging port to be ready
+    ok = _wait_port('127.0.0.1', port, timeout=timeout)
+    if not ok and headless:
+        # fallback: try again without headless (some sites require non-headless)
+        proc.kill()
+        time.sleep(0.5)
+        # try non-headless
+        args = [
+            chrome_path,
+            f'--remote-debugging-port={port}',
+            f'--user-data-dir={user_data_dir}',
+            f'--profile-directory={profile_name}',
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-popup-blocking',
+            '--disable-default-apps',
+            '--disable-infobars',
+            '--window-size=1920,1080'
+        ]
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ok = _wait_port('127.0.0.1', port, timeout=timeout)
+        if not ok:
+            proc.kill()
+            raise RuntimeError(f"Chrome remote debugging port {port} not available after fallback start.")
+
+    if not ok:
+        proc.kill()
+        raise RuntimeError(f"Chrome remote debugging port {port} not available.")
+
+    # Attach Selenium to the running Chrome via debuggerAddress
     options = Options()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    return webdriver.Chrome(options=options)
 
+    # Important: do NOT also set options.headless here — we're attaching to the launched Chrome.
+    driver = webdriver.Chrome(options=options)
+    return driver
 def install_early_hook(driver):
     HOOK_SRC = r"""
     (function(){
@@ -232,11 +320,11 @@ if __name__ == "__main__":
     set_sort_to_all_comments(d)
     hook_graphql(d)
 
-    # ép FB tạo UFI nếu chưa có
-    time.sleep(0.8)
-    for _ in range(3):
-        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-        time.sleep(0.4)
+    # # ép FB tạo UFI nếu chưa có
+    # time.sleep(0.8)
+    # for _ in range(3):
+    #     d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
+    #     time.sleep(0.4)
 
     # tìm request comment đầu để suy biến form (nếu cần)
     all_reqs = d.execute_script("return window.__gqlReqs || []")
@@ -259,7 +347,7 @@ if __name__ == "__main__":
 
     # Batch đầu tiên: đọc trực tiếp từ responseText (đã hook) thay vì replay
     first_resptext = comm_reqs[0].get("responseText") or ""
-    texts, _, total_target, obj0 = extract_comments_from_resptext(first_resptext)
+    texts, _, total_target, obj0 = extract_full_posts_from_resptext(first_resptext)
     # Lưu batch đầu (để nguyên object đầu cho debug), có thể đổi sang chỉ lưu texts nếu muốn
     json.dump(obj0, open(OUT_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
     print(f"[BATCH#1] comments extracted: {len(texts)}")
@@ -282,6 +370,11 @@ if __name__ == "__main__":
 
         # 2) đợi đúng 1 request comment mới
         nxt = wait_next_comment_req(d, baseline_idx, timeout=8, poll=0.2)
+        retry_count = 0
+        while not nxt and retry_count < 3:
+            retry_count += 1
+        if retry_count == 3:
+            break
         if not nxt:
             print(f"[{rounds}] Không thấy request mới sau khi cuộn/click, thử lại…")
             continue
@@ -290,7 +383,7 @@ if __name__ == "__main__":
         baseline_idx = idx + 1
 
         resp_text = req.get("responseText") or ""
-        batch_texts, _, maybe_total, _ = extract_comments_from_resptext(resp_text)
+        batch_texts, _, maybe_total, _ = extract_full_posts_from_resptext(resp_text)
         if batch_texts:
             texts.extend(batch_texts)
             print(f"[{rounds}] +{len(batch_texts)} → total={len(texts)}/{total_target}")

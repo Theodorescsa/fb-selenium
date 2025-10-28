@@ -1,0 +1,18 @@
+{
+  "cursor": null,
+  "vars_template": {
+    "commentsIntentToken": "RANKED_UNFILTERED_CHRONOLOGICAL_REPLIES_INTENT_V1",
+    "feedLocation": "POST_PERMALINK_DIALOG",
+    "feedbackSource": 2,
+    "focusCommentID": null,
+    "scale": 1,
+    "useDefaultActor": false,
+    "id": "ZmVlZGJhY2s6MTQyNDY1MjE1OTU4Nzg4OA==",
+    "__relay_internal__pv__CometUFICommentAvatarStickerAnimatedImagerelayprovider": false,
+    "__relay_internal__pv__IsWorkUserrelayprovider": false
+  },
+  "cursor_key": "commentsAfterCursor",
+  "doc_id": "25769885599281342",
+  "friendly": "CommentListComponentsRootQuery",
+  "ts": 1761627521.8019178
+}
