@@ -339,8 +339,31 @@ def deep_find_has_next(obj):
 # =========================
 # Story collector + rid
 # =========================
-POST_URL_RE = re.compile(r"https?://(?:web\.)?facebook\.com/groups/[^/]+/(?:permalink|posts)/(\d+)/?$", re.I)
+POST_URL_RE = re.compile(
+    r"""https?://(?:web\.)?facebook\.com/
+        (?:
+            groups/[^/]+/(?:permalink|posts)/\d+
+          | [A-Za-z0-9.\-]+/posts/\d+
+          | [A-Za-z0-9.\-]+/reel/\d+
+          | photo(?:\.php)?\?(?:.*(?:fbid|story_fbid|video_id)=\d+)
+          | .*?/pfbid[A-Za-z0-9]+
+        )
+    """, re.I | re.X
+)
+def filter_only_feed_posts(items):
+    keep = []
+    for it in items or []:
+        link = (it.get("link") or "").strip()
+        rid  = (it.get("rid")  or "").strip()
+        fbid = (it.get("id")   or "").strip()
 
+        ok_link = bool(link and POST_URL_RE.match(link))
+        ok_fbid = bool(fbid and fbid.startswith("Uzpf"))  # classic story ID
+        ok_rid  = bool(rid)
+
+        if ok_link or ok_fbid or ok_rid:
+            keep.append(it)
+    return keep
 def _get_text_from_node(n: dict):
     if isinstance(n.get("message"), dict):
         t = n["message"].get("text")
@@ -380,28 +403,37 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
             url_digits = _extract_url_digits(url)
             rid        = post_id_api or url_digits or fb_id
 
-            # author & type label
-            author_id, author_name, author_link, avatar, type_label = extract_author(obj)
+            # # author & type label
+            # author_id, author_name, author_link, avatar, type_label = extract_author(obj)
 
-            text = _get_text_from_node(obj)
+            # text = _get_text_from_node(obj)
 
-            image_urls, video_urls = extract_media(obj)
-            counts = extract_reactions_and_counts(obj)
-            created = extract_created_time(obj)
-            is_share, link_share, type_share, origin_id = extract_share_flags(obj)
-            hashtags = extract_hashtags(text)
+            # image_urls, video_urls = extract_media(obj)
+            # counts = extract_reactions_and_counts(obj)
+            # created = extract_created_time(obj)
+            # is_share, link_share, type_share, origin_id = extract_share_flags(obj)
+            # hashtags = extract_hashtags(text)
+            # # author & type label
+            author_id , author_name, author_link, avatar, type_label = None, None, None, None, None
 
+            text = None
+
+            image_urls, video_urls = None, None
+            counts = None
+            created = None
+            is_share, link_share, type_share, origin_id = None, None, None, None
+            hashtags = None
             # source_id (group id/slug best-effort)
             source_id = None
-            _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
-            if _v: source_id = _v
-            if not source_id:
-                try:
-                    slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
-                    source_id = slug
-                except:
-                    pass
-
+            # _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
+            # if _v: source_id = _v
+            # if not source_id:
+            #     try:
+            #         slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
+            #         source_id = slug
+            #     except:
+            #         pass
+            
             out.append({
                 "id": fb_id,                 # <- id gốc nếu có
                 "rid": rid,                  # id dùng để dedupe
@@ -414,15 +446,15 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
                 "created_time": created,     # giữ epoch như mẫu
                 "content": text,
                 "image_url": image_urls,     # mảng
-                "like": counts["like"],
-                "comment": counts["comment"],
-                "haha": counts["haha"],
-                "wow": counts["wow"],
-                "sad": counts["sad"],
-                "love": counts["love"],
-                "angry": counts["angry"],
-                "care": counts["care"],
-                "share": counts["share"],
+                # "like": counts["like"],
+                # "comment": counts["comment"],
+                # "haha": counts["haha"],
+                # "wow": counts["wow"],
+                # "sad": counts["sad"],
+                # "love": counts["love"],
+                # "angry": counts["angry"],
+                # "care": counts["care"],
+                # "share": counts["share"],
                 "hashtag": hashtags,         # mảng, lowercase
                 "video": video_urls,         # mảng
                 "source_id": source_id,
@@ -565,11 +597,10 @@ def _best_primary_key(it: dict) -> str | None:
     norm = _norm_link(link) if link else None
     digits = _extract_digits_from_fb_link(link) if link else None
 
-    for k in (rid, _id, digits, norm):
+    for k in (rid, _id):
         if isinstance(k, str) and k.strip():
             return k.strip()
     return None
-
 def _all_join_keys(it: dict) -> list[str]:
     """Tập khóa để GỘP: rid, id, digits từ link, normalized link."""
     keys = []
@@ -577,29 +608,19 @@ def _all_join_keys(it: dict) -> list[str]:
     _id = it.get("id")
     link = it.get("link")
 
+    keys = []
     if isinstance(rid, str) and rid.strip(): keys.append(rid.strip())
     if isinstance(_id,  str) and _id.strip(): keys.append(_id.strip())
+    return list(dict.fromkeys(keys))
 
-    d = _extract_digits_from_fb_link(link) if link else None
-    if d: keys.append(d)
-
-    norm = _norm_link(link) if link else None
-    if norm: keys.append(norm)
-
-    # unique, giữ thứ tự
-    seen, out = set(), []
-    for k in keys:
-        if k not in seen:
-            out.append(k); seen.add(k)
-    return out
 
 def coalesce_posts(items: list[dict]) -> list[dict]:
     """
     Gộp các record cùng post theo TẬP KHÓA {rid, id, digits(link), normalized_link}.
-    Nếu bất kỳ khóa nào trùng → merge cùng 1 group.
+    Nếu BẤT KỲ khóa nào trùng → merge vào cùng một group.
     """
-    groups: dict[str, dict] = {}      # representative by group_id
-    key2group: dict[str, str] = {}    # map mỗi key -> group_id
+    groups: dict[str, dict] = {}
+    key2group: dict[str, str] = {}
     seq = 0
 
     def _new_group_id() -> str:
@@ -607,20 +628,25 @@ def coalesce_posts(items: list[dict]) -> list[dict]:
         seq += 1
         return f"g{seq}"
 
-    for it in items or []:
-        keys = _all_join_keys(it)
+    for it in (items or []):
+        # Lấy toàn bộ khóa có thể join (rid, id, digits(link), qid, norm_link)
+        keys = _all_join_keys(it)  # yêu cầu bạn đã có sẵn hàm này
+
         # tìm group hiện có nếu bất kỳ key nào đã thấy
         gid = None
         for k in keys:
             if k in key2group:
-                gid = key2group[k]; break
+                gid = key2group[k]
+                break
+
+        # tạo mới hoặc merge
         if gid is None:
             gid = _new_group_id()
             groups[gid] = it
         else:
-            groups[gid] = merge_two_posts(groups[gid], it)
+            groups[gid] = merge_two_posts(groups[gid], it)  # yêu cầu bạn đã có sẵn hàm này
 
-        # cập nhật map cho TẤT CẢ keys của nhóm sau khi merge
+        # cập nhật lại mapping cho TẤT CẢ key sau khi merge (để khóa mới sinh ra cũng map đúng)
         merged_keys = _all_join_keys(groups[gid])
         for k in merged_keys:
             key2group[k] = gid
@@ -848,8 +874,8 @@ if __name__ == "__main__":
 
         page_posts = []
         collect_post_summaries(obj0, page_posts)
-        page_posts = filter_only_group_posts(page_posts)
-        page_posts = coalesce_posts(page_posts)  # ✅ gộp đa-khóa
+        page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
+
 
         cursors = deep_collect_cursors(obj0)
         has_next = deep_find_has_next(obj0)
@@ -905,8 +931,8 @@ if __name__ == "__main__":
 
         page_posts = []
         collect_post_summaries(obj, page_posts)
-        page_posts = filter_only_group_posts(page_posts)
-        page_posts = coalesce_posts(page_posts)  # ✅ gộp trước
+        page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
+
 
         cursors = deep_collect_cursors(obj)
         has_next = deep_find_has_next(obj)
