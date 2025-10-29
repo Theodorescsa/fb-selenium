@@ -152,6 +152,7 @@ def start_driver(chrome_path,
 
     # Important: do NOT also set options.headless here — we're attaching to the launched Chrome.
     driver = webdriver.Chrome(options=options)
+    
     return driver
 
 # =========================
@@ -390,8 +391,18 @@ def _looks_like_group_post(n: dict) -> bool:
 
 def _extract_url_digits(url: str):
     if not url: return None
-    m = POST_URL_RE.match(url)
-    return m.group(1) if m else None
+    try:
+        path = urlparse(url).path.lower()
+    except:
+        path = url.lower()
+    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
+    if m: return m.group(1)
+    qs = parse_qs(urlparse(url).query)
+    for k in ("fbid","story_fbid","video_id","photo_id","id","v"):
+        v = qs.get(k)
+        if v and v[0] and v[0].isdigit():
+            return v[0]
+    return None
 
 # === replace collect_post_summaries bằng bản này ===
 def collect_post_summaries(obj, out, group_url=GROUP_URL):

@@ -1303,7 +1303,7 @@ def run_cursor_only(d, form, vars_template, seen_ids, page_limit=None, resume=Fa
 # =========================
 # MAIN
 # =========================
-# from get_posts_fb_automation import start_driver
+from get_posts_fb_automation import start_driver
 if __name__ == "__main__":
     import argparse
 
@@ -1314,20 +1314,19 @@ if __name__ == "__main__":
                     help="Giới hạn số trang để test (None = không giới hạn).")
     args = ap.parse_args()
 
-    # CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    # USER_DATA_DIR = r"E:\NCS\Userdata"
-    # PROFILE_NAME  = "Profile 5"
-    # REMOTE_PORT   = 9222
+    CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    USER_DATA_DIR = r"E:\NCS\Userdata"
+    PROFILE_NAME  = "Profile 5"
+    REMOTE_PORT   = 9222
 
-    # # Nếu bạn đã có start_driver(...), dùng nó; không thì đổi lại start_driver_with_proxy(PROXY_URL, headless=False)
-    # d = start_driver(
-    #     chrome_path=CHROME_PATH,
-    #     user_data_dir=USER_DATA_DIR,
-    #     profile_name=PROFILE_NAME,
-    #     port=REMOTE_PORT,
-    #     headless=False
-    # )
-    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    # Nếu bạn đã có start_driver(...), dùng nó; không thì đổi lại start_driver_with_proxy(PROXY_URL, headless=False)
+    d = start_driver(
+        chrome_path=CHROME_PATH,
+        user_data_dir=USER_DATA_DIR,
+        profile_name=PROFILE_NAME,
+        port=REMOTE_PORT,
+        headless=False
+    )
     d.set_script_timeout(40)
     try:
         d.execute_cdp_cmd("Network.enable", {})
@@ -1336,7 +1335,7 @@ if __name__ == "__main__":
         pass
 
     # Nếu đang dùng profile thật (USER_DATA_DIR), có thể bỏ bootstrap_auth.
-    bootstrap_auth(d)
+    # bootstrap_auth(d)
 
     try:
         install_early_hook(d, keep_last=KEEP_LAST)
