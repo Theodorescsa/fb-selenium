@@ -404,35 +404,35 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
             rid        = post_id_api or url_digits or fb_id
 
             # # author & type label
-            # author_id, author_name, author_link, avatar, type_label = extract_author(obj)
+            author_id, author_name, author_link, avatar, type_label = extract_author(obj)
 
-            # text = _get_text_from_node(obj)
+            text = _get_text_from_node(obj)
 
-            # image_urls, video_urls = extract_media(obj)
-            # counts = extract_reactions_and_counts(obj)
-            # created = extract_created_time(obj)
-            # is_share, link_share, type_share, origin_id = extract_share_flags(obj)
-            # hashtags = extract_hashtags(text)
-            # # author & type label
-            author_id , author_name, author_link, avatar, type_label = None, None, None, None, None
+            image_urls, video_urls = extract_media(obj)
+            counts = extract_reactions_and_counts(obj)
+            created = extract_created_time(obj)
+            is_share, link_share, type_share, origin_id = extract_share_flags(obj)
+            hashtags = extract_hashtags(text)
+            # author & type label
+            # author_id , author_name, author_link, avatar, type_label = None, None, None, None, None
 
-            text = None
+            # text = None
 
-            image_urls, video_urls = None, None
-            counts = None
-            created = None
-            is_share, link_share, type_share, origin_id = None, None, None, None
-            hashtags = None
-            # source_id (group id/slug best-effort)
+            # image_urls, video_urls = None, None
+            # counts = None
+            # created = None
+            # is_share, link_share, type_share, origin_id = None, None, None, None
+            # hashtags = None
+            # # source_id (group id/slug best-effort)
             source_id = None
-            # _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
-            # if _v: source_id = _v
-            # if not source_id:
-            #     try:
-            #         slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
-            #         source_id = slug
-            #     except:
-            #         pass
+            _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
+            if _v: source_id = _v
+            if not source_id:
+                try:
+                    slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
+                    source_id = slug
+                except:
+                    pass
             
             out.append({
                 "id": fb_id,                 # <- id gốc nếu có
@@ -446,15 +446,15 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
                 "created_time": created,     # giữ epoch như mẫu
                 "content": text,
                 "image_url": image_urls,     # mảng
-                # "like": counts["like"],
-                # "comment": counts["comment"],
-                # "haha": counts["haha"],
-                # "wow": counts["wow"],
-                # "sad": counts["sad"],
-                # "love": counts["love"],
-                # "angry": counts["angry"],
-                # "care": counts["care"],
-                # "share": counts["share"],
+                "like": counts["like"],
+                "comment": counts["comment"],
+                "haha": counts["haha"],
+                "wow": counts["wow"],
+                "sad": counts["sad"],
+                "love": counts["love"],
+                "angry": counts["angry"],
+                "care": counts["care"],
+                "share": counts["share"],
                 "hashtag": hashtags,         # mảng, lowercase
                 "video": video_urls,         # mảng
                 "source_id": source_id,

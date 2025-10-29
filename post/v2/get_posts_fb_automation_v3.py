@@ -18,7 +18,9 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 from pathlib import Path
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
-
+from get_info import *
+from get_info import _all_urls_from_text
+from get_info import _dig_attachment_urls
 # =========================
 # CONFIG — chỉnh theo máy bạn
 # =========================
@@ -156,37 +158,159 @@ def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver
         }
 
     driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
-    driver.scopes = [r".*/api/graphql/.*"]
+    driver.scopes = [r".*"]
     return driver
 # =========================
 # (Optional) bootstrap_auth — nạp cookies/localStorage nếu có
 # =========================
+ALLOWED_COOKIE_DOMAINS = {".facebook.com", "facebook.com", "m.facebook.com", "web.facebook.com"}
+
+def _coerce_epoch(v):
+    # nhận cả int/float/str; auto đổi ms->s nếu cần
+    try:
+        vv = float(v)
+        if vv > 10_000_000_000:  # ms
+            vv = vv / 1000.0
+        return int(vv)
+    except Exception:
+        return None
+
+def _normalize_cookie(c: dict) -> Optional[dict]:
+    """
+    Chuẩn hoá cookie theo định dạng Selenium:
+      {name, value, domain, path, secure, httpOnly, expiry}
+    Hỗ trợ các key phổ biến từ DevTools/extension: expirationDate, expires, sameSite, hostOnly...
+    """
+    if not isinstance(c, dict): 
+        return None
+    name  = c.get("name")
+    value = c.get("value")
+    if not name or value is None:
+        return None
+
+    # Domain & path
+    domain = c.get("domain")
+    # hostOnly=true → KHÔNG nên có dấu chấm đầu
+    host_only = c.get("hostOnly", False)
+    if domain:
+        domain = domain.strip()
+        if host_only and domain.startswith("."):
+            domain = domain.lstrip(".")
+    # fallback nếu thiếu domain
+    if not domain:
+        domain = "facebook.com"
+
+    # chỉ nhận domain FB
+    if not any(domain.endswith(d) or ("."+domain).endswith(d) for d in ALLOWED_COOKIE_DOMAINS):
+        return None
+
+    path = c.get("path") or "/"
+
+    # Secure/httpOnly
+    secure    = bool(c.get("secure", True))
+    httpOnly  = bool(c.get("httpOnly", c.get("httponly", False)))
+
+    # Expiry: Selenium cần 'expiry' (epoch giây, int). Map từ các biến thể khác.
+    expiry = c.get("expiry", None)
+    if expiry is None:
+        expiry = c.get("expirationDate", None)
+    if expiry is None:
+        expiry = c.get("expires", None)   # nhiều tool export 'expires'
+    expiry = _coerce_epoch(expiry) if expiry is not None else None
+
+    # Build dict đúng spec Selenium
+    out = {
+        "name": name,
+        "value": value,
+        "domain": domain,
+        "path": path,
+        "secure": secure,
+        "httpOnly": httpOnly,
+    }
+    if expiry is not None:
+        out["expiry"] = expiry
+
+    return out
+
+def _add_cookies_safely(driver, cookies_path: Path):
+    with open(cookies_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and "cookies" in raw:
+        raw = raw["cookies"]  # một số định dạng bọc thêm
+    if not isinstance(raw, list):
+        raise ValueError("File cookies không phải mảng JSON.")
+
+    added = 0
+    for c in raw:
+        nc = _normalize_cookie(c)
+        if not nc:
+            continue
+        try:
+            driver.add_cookie(nc)
+            added += 1
+        except Exception as e:
+            # Ví dụ: domain không khớp origin hiện tại
+            # Có thể thử lại sau khi chuyển origin tương ứng, nhưng ở đây ta skip.
+            # print(f"[SKIP] {nc.get('name')}: {e}")
+            pass
+    return added
+
+def _set_kv_storage(driver, kv_path: Path, storage: str = "localStorage"):
+    with open(kv_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        for k, v in data.items():
+            driver.execute_script(f"{storage}.setItem(arguments[0], arguments[1]);", k, v)
+
 def bootstrap_auth(d):
+    """
+    - Vào đúng origin trước khi add cookies.
+    - Nạp cookies (đúng key 'expiry'), sau đó refresh.
+    - Nạp localStorage (và sessionStorage nếu có).
+    - Kiểm tra nhanh cặp c_user/xs.
+    """
+    d.get("https://www.facebook.com/")
+    time.sleep(1.0)
+
+    # 1) Cookies
     if COOKIES_PATH and os.path.exists(COOKIES_PATH):
         try:
+            count = _add_cookies_safely(d, Path(COOKIES_PATH))
+            # refresh để browser apply
             d.get("https://www.facebook.com/")
-            with open(COOKIES_PATH, "r", encoding="utf-8") as f:
-                cookies = json.load(f)
-            for c in cookies:
-                cookie = {k: c[k] for k in ("name","value","domain","path","secure","httpOnly","expiry") if k in c}
-                if "expiry" in cookie and "expires" not in cookie:
-                    cookie["expires"] = cookie.pop("expiry")
-                d.add_cookie(cookie)
-            d.get("https://www.facebook.com/")
+            time.sleep(1.0)
+            print(f"[AUTH] Added cookies: {count}")
         except Exception as e:
             print("[WARN] bootstrap cookies:", e)
 
+    # 2) localStorage
     if LOCALSTORAGE_PATH and os.path.exists(LOCALSTORAGE_PATH):
         try:
             d.get("https://www.facebook.com/")
-            with open(LOCALSTORAGE_PATH, "r", encoding="utf-8") as f:
-                kv = json.load(f)
-            for k,v in kv.items():
-                d.execute_script("localStorage.setItem(arguments[0], arguments[1]);", k, v)
+            _set_kv_storage(d, Path(LOCALSTORAGE_PATH), "localStorage")
             d.get("https://www.facebook.com/")
+            time.sleep(0.8)
         except Exception as e:
             print("[WARN] bootstrap localStorage:", e)
 
+    # 3) (Optional) sessionStorage nếu bạn có file
+    if SESSIONSTORAGE_PATH and os.path.exists(SESSIONSTORAGE_PATH):
+        try:
+            d.get("https://www.facebook.com/")
+            _set_kv_storage(d, Path(SESSIONSTORAGE_PATH), "sessionStorage")
+            d.get("https://www.facebook.com/")
+            time.sleep(0.8)
+        except Exception as e:
+            print("[WARN] bootstrap sessionStorage:", e)
+
+    # 4) Quick sanity check: đã có c_user & xs chưa?
+    try:
+        all_cookies = {c["name"]: c.get("value") for c in d.get_cookies()}
+        has_cuser = "c_user" in all_cookies
+        has_xs    = "xs" in all_cookies
+        print(f"[AUTH] c_user={has_cuser}, xs={has_xs}")
+    except Exception:
+        pass
 # =========================
 # Request matching / parsing
 # =========================
@@ -459,6 +583,132 @@ def _extract_url_digits(url: str) -> Optional[str]:
         if v and v[0] and v[0].isdigit():
             return v[0]
     return None
+def _dig_text(o):
+    """Tìm text theo các pattern thường gặp; trả về list các đoạn text không rỗng."""
+    texts = []
+
+    def take(x):
+        if isinstance(x, str):
+            t = x.strip()
+            if t and t.lower() not in {"see more", "xem thêm"}:
+                texts.append(t)
+
+    def dive(v):
+        if isinstance(v, dict):
+            # 1) node kiểu {text: "..."}
+            if "text" in v and isinstance(v["text"], str):
+                take(v["text"])
+
+            # 2) message/body có field text
+            if "message" in v and isinstance(v["message"], dict):
+                if isinstance(v["message"].get("text"), str):
+                    take(v["message"]["text"])
+
+            if "body" in v and isinstance(v["body"], dict):
+                if isinstance(v["body"].get("text"), str):
+                    take(v["body"]["text"])
+
+            # 3) caption video/photo
+            if "savable_description" in v and isinstance(v["savable_description"], dict):
+                if isinstance(v["savable_description"].get("text"), str):
+                    take(v["savable_description"]["text"])
+
+            # 4) một số tiêu đề mô tả
+            for k in ("title", "subtitle", "headline", "label", "contextual_message"):
+                val = v.get(k)
+                if isinstance(val, dict) and isinstance(val.get("text"), str):
+                    take(val["text"])
+                elif isinstance(val, str):
+                    take(val)
+
+            # 5) đi sâu hơn
+            for vv in v.values():
+                dive(vv)
+
+        elif isinstance(v, list):
+            for it in v:
+                dive(it)
+
+    dive(o)
+    # loại các đoạn trùng nhau, bảo toàn thứ tự
+    uniq, seen = [], set()
+    for t in texts:
+        if t not in seen:
+            uniq.append(t); seen.add(t)
+    return uniq
+
+
+def _extract_share_texts(n: dict):
+    """
+    Trả về (actor_text, attached_text, combined)
+    - actor_text: caption do người đang đăng viết (nhánh message của post hiện tại)
+    - attached_text: caption/bài gốc nếu là share
+    - combined: actor_text + 1 dòng ngăn + attached_text (nếu có)
+    """
+    actor_texts = []
+    attached_texts = []
+
+    # caption trực tiếp của post (người share viết)
+    # ưu tiên các nhánh dễ đoán
+    if isinstance(n.get("message"), dict) and isinstance(n["message"].get("text"), str):
+        actor_texts.append(n["message"]["text"])
+
+    # nhiều post video/collage: nằm trong comet_sections.message
+    cs = n.get("comet_sections") or {}
+    if isinstance(cs, dict):
+        msg = cs.get("message")
+        if isinstance(msg, dict):
+            t = msg.get("text")
+            if isinstance(t, str) and t.strip():
+                actor_texts.append(t)
+
+        # bài gốc (attached story)
+        attached = cs.get("attached_story") or cs.get("content") or {}
+        if isinstance(attached, dict):
+            # content.story.message hoặc attached_story.message
+            story = attached.get("story") if isinstance(attached.get("story"), dict) else attached
+            if isinstance(story, dict):
+                if isinstance(story.get("message"), dict) and isinstance(story["message"].get("text"), str):
+                    attached_texts.append(story["message"]["text"])
+                # fallback: đào text sâu toàn bộ story
+                attached_texts.extend(_dig_text(story))
+
+    # fallback rộng: đào toàn bộ node để vơ vết text
+    if not actor_texts:
+        actor_texts.extend(_dig_text(n))
+
+    # lọc bớt các text dài dòng lặp lại (unique, giữ trật tự)
+    def _uniq_keep(seq):
+        out, seen = [], set()
+        for s in seq:
+            s2 = s.strip()
+            if s2 and s2 not in seen:
+                out.append(s2); seen.add(s2)
+        return out
+
+    actor_texts = _uniq_keep(actor_texts)
+    attached_texts = _uniq_keep(attached_texts)
+
+    # merge “đẹp”: nếu có cả hai, chèn 1 dòng phân cách
+    if actor_texts and attached_texts:
+        combined = actor_texts[0]
+        # nếu caption share ngắn giống đầu attached -> tránh lặp
+        if combined not in attached_texts:
+            combined = combined + "\n\n" + attached_texts[0]
+    elif actor_texts:
+        combined = actor_texts[0]
+    elif attached_texts:
+        combined = attached_texts[0]
+    else:
+        combined = None
+
+    return (actor_texts[0] if actor_texts else None,
+            attached_texts[0] if attached_texts else None,
+            combined)
+
+def _get_text_from_node(n: dict):
+    _, _, combined = _extract_share_texts(n)
+    return combined
 
 def collect_post_summaries(obj, out, group_url=GROUP_URL):
     if isinstance(obj, dict):
@@ -468,19 +718,90 @@ def collect_post_summaries(obj, out, group_url=GROUP_URL):
             url        = obj.get("wwwURL") or obj.get("url")
             url_digits = _extract_url_digits(url)
             rid        = post_id_api or url_digits or fb_id
+            author_id, author_name, author_link, avatar, type_label = extract_author(obj)
+
+            # ✅ NEW: gom text
+            actor_text, attached_text, text_combined = _extract_share_texts(obj)
+            # print("Text", text_combined)  # giữ hoặc bỏ tuỳ nhu cầu log
+
+            image_urls, video_urls = extract_media(obj)
+            counts = extract_reactions_and_counts(obj)
+            smart_is_share, smart_link, smart_type, origin_id, share_meta = extract_share_flags_smart(obj, actor_text or text_combined)
+
+            created = extract_created_time(obj)
+            is_share, link_share, type_share, origin_id = extract_share_flags(obj)
+            hashtags = extract_hashtags(text_combined)
             created_candidates = deep_collect_timestamps(obj)
             created = max(created_candidates) if created_candidates else None
-            out.append({
+            out_links = list(dict.fromkeys(_all_urls_from_text(text_combined or "") + _dig_attachment_urls(obj)[0]))
+            out_domains = []
+            for u in out_links:
+                try:
+                    host = urlparse(u).netloc.lower().split(":")[0]
+                    if host: out_domains.append(host)
+                except: pass
+            out_domains = list(dict.fromkeys(out_domains))
+            source_id = None
+            _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
+            if _v: source_id = _v
+            if not source_id:
+                try:
+                    slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
+                    source_id = slug
+                except:
+                    pass
+
+            item = {
                 "id": fb_id,
                 "rid": rid,
+                "type": type_label,
                 "link": url,
+                "author_id": author_id,
+                "author": author_name,
+                "author_link": author_link,
+                "avatar": avatar,
                 "created_time": created,
-            })
+                "content": text_combined,
+                "image_url": image_urls,
+                "like": counts["like"],
+                "comment": counts["comment"],
+                "haha": counts["haha"],
+                "wow": counts["wow"],
+                "sad": counts["sad"],
+                "love": counts["love"],
+                "angry": counts["angry"],
+                "care": counts["care"],
+                "share": counts["share"],
+                "hashtag": hashtags,
+                "video": video_urls,
+                "source_id": None,
+                # 🔥 share info mới
+                "is_share": smart_is_share,
+                "link_share": smart_link,
+                "type_share": smart_type,
+                "origin_id": origin_id,
+                # mở rộng thông tin
+                "out_links": out_links,
+                "out_domains": out_domains,
+            }
+            # (Optional) Lưu kèm raw parts để debug / phân tích
+            if share_meta:
+                item["share_meta"] = share_meta
+
+            # (giữ optional parts để debug)
+            if smart_is_share:
+                item["content_parts"] = {
+                    "actor_text": actor_text,
+                    "attached_text": attached_text
+                }
+
+            out.append(item)
         for v in obj.values():
             collect_post_summaries(v, out, group_url)
     elif isinstance(obj, list):
         for v in obj:
             collect_post_summaries(v, out, group_url)
+
 
 def filter_only_feed_posts(items):
     keep = []
@@ -932,7 +1253,7 @@ def run_year_by_year(d, boot_form, vars_template, seen_ids):
 # MAIN
 # =========================
 if __name__ == "__main__":
-    d = start_driver_with_proxy(PROXY_URL, headless=True)
+    d = start_driver_with_proxy(PROXY_URL, headless=False)
     d.set_script_timeout(40)  # mặc định 30s, ta nới nhẹ
     try:
         d.execute_cdp_cmd("Network.enable", {})

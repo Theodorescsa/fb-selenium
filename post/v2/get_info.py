@@ -282,3 +282,135 @@ def extract_hashtags(text):
         if t not in seen:
             out.append(t); seen.add(t)
     return out
+
+from urllib.parse import urlparse
+URL_RE = re.compile(r'https?://[^\s)>\]"]+', re.I)
+
+FB_HOSTS = {
+    "facebook.com","www.facebook.com","m.facebook.com","web.facebook.com",
+    "fb.watch","fb.me","fb.com"
+}
+def _clean_url(u:str)->str:
+    if not isinstance(u,str): return ""
+    u=u.strip()
+    # bỏ dấu ')' hoặc '…' dư ở cuối
+    return u.rstrip(').,]»›…')
+
+def _is_fb(u:str)->bool:
+    try:
+        host = urlparse(u).netloc.lower()
+        host = host.split(":")[0]
+        return any(host==h or host.endswith("."+h) for h in FB_HOSTS)
+    except: 
+        return False
+
+def _all_urls_from_text(s: str):
+    if not isinstance(s,str) or not s: return []
+    urls = [ _clean_url(m.group(0)) for m in URL_RE.finditer(s) ]
+    # unique, giữ thứ tự
+    seen=set(); out=[]
+    for u in urls:
+        if u not in seen:
+            out.append(u); seen.add(u)
+    return out
+
+def _dig_attachment_urls(n:dict):
+    """
+    Lục các URL trong attachments/shareable để lấy OG meta.
+    Trả về (urls, meta) với meta có og_title/og_desc/site_name nếu có.
+    """
+    urls, meta = [], {}
+    def take(u):
+        u=_clean_url(u)
+        if u and u not in urls:
+            urls.append(u)
+
+    def dive(x):
+        if isinstance(x, dict):
+            # các key hay chứa URL
+            for k in ("url","canonical_url","source","href","permalink_url","external_url"):
+                v=x.get(k)
+                if isinstance(v,str): take(v)
+            # OG-esque meta
+            for (k1,k2) in (("title","og_title"),("subtitle","og_desc"),("site_name","og_site_name"),("publisher","og_site_name")):
+                if isinstance(x.get(k1), dict) and isinstance(x[k1].get("text"), str):
+                    meta.setdefault(k2, x[k1]["text"].strip())
+                elif isinstance(x.get(k1), str):
+                    meta.setdefault(k2, x[k1].strip())
+
+            for v in x.values(): dive(v)
+        elif isinstance(x, list):
+            for v in x: dive(v)
+    dive(n)
+    return urls, meta
+
+def extract_share_flags_smart(n: dict, actor_text: str = None):
+    """
+    Trả về: (is_share, link_share, type_share, origin_id, share_meta)
+    - link_share: ưu tiên URL 'ngoài FB'. Nếu không có → nếu share bài FB thì trả permalink FB.
+    - type_share: 'link' nếu out-domain, 'post' nếu là share nội bộ FB.
+    - origin_id: id bài gốc nếu tóm được
+    - share_meta: {og_title, og_desc, og_site_name} nếu có
+    """
+    is_share, link_share, type_share, origin_id = False, None, None, None
+    share_meta = {}
+
+    cs = n.get("comet_sections") or {}
+    # 1) cố nhìn attached/content story (nếu share)
+    cand_nodes = []
+    if isinstance(cs, dict):
+        for k in ("attached_story","content","context_layout"):
+            v = cs.get(k)
+            if isinstance(v, dict):
+                cand_nodes.append(v)
+                if isinstance(v.get("story"), dict):
+                    cand_nodes.append(v["story"])
+
+    # 2) attachments các kiểu
+    if isinstance(n.get("attachments"), (list,dict)):
+        cand_nodes.append(n["attachments"])
+    if isinstance(n.get("story_attachment"), dict):
+        cand_nodes.append(n["story_attachment"])
+
+    # gom URL + meta trong attachments
+    att_urls = []
+    for node in cand_nodes:
+        u, meta = _dig_attachment_urls(node)
+        att_urls.extend(u)
+        share_meta.update({k:v for k,v in meta.items() if v})
+
+    # 3) URL trong caption
+    text_urls = _all_urls_from_text(actor_text or "")
+
+    # 4) hợp nhất ứng viên URL
+    all_urls = []
+    for arr in (text_urls, att_urls):
+        for u in arr:
+            if u not in all_urls:
+                all_urls.append(u)
+
+    # 5) quyết định link_share/type_share
+    # ưu tiên link ngoài FB
+    ext = [u for u in all_urls if not _is_fb(u)]
+    if ext:
+        link_share = ext[0]
+        type_share = "link"
+        is_share = True
+    else:
+        # fallback: nếu có permalink/canonical FB của bài đính kèm → share post
+        fb_urls = [u for u in all_urls if _is_fb(u)]
+        if fb_urls:
+            link_share = fb_urls[0]
+            type_share = "post"
+            is_share = True
+
+    # 6) origin_id (nếu mò thấy)
+    for node in cand_nodes:
+        if isinstance(node, dict):
+            for key in ("id","post_id","legacy_api_post_id","shareable_id","target_id"):
+                val = node.get(key)
+                if isinstance(val, str) and val.isdigit():
+                    origin_id = val; break
+        if origin_id: break
+
+    return is_share, link_share, type_share, origin_id, share_meta
