@@ -1,159 +1,53 @@
-import json, re, time, random, urllib.parse, subprocess, os, sys, datetime
-from selenium import webdriver
+# -*- coding: utf-8 -*-
+"""
+Facebook GraphQL Feed Crawler — Cursor-first (no time-slice)
+- Hook sớm /api/graphql để "hứng" request và response.
+- Resume bằng cursor + seen_ids trong checkpoint (nhưng KHÔNG ép dùng cursor cũ nếu có thể bám head).
+- Head-probe: luôn "đặt chân" vào trang đầu hiện tại để lấy endCursor mới nhất trước khi paginate.
+- Khi tiến độ chậm / next=False nhiều vòng: thử soft-refetch (không đụng UI), rồi hard-reload form/doc_id.
+- Fast-forward (nhảy 1-2 hops) khi fresh=0 nhưng has_next=True lặp lại.
+
+⚠️ Chỉ crawl nội dung bạn có quyền truy cập. Tôn trọng Điều khoản sử dụng của nền tảng.
+"""
+import argparse
+import os, re, json, time, random, datetime, urllib.parse, socket
+from typing import Dict, Any, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs, urlunparse, urlencode
+from pathlib import Path
+
+from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException as _SETimeout
+
+# ==== custom utils bạn đã có trong get_info.py (yêu cầu file này tồn tại) ====
 from get_info import *
-import socket
-CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
-
-def strip_cursors_from_vars(v: dict) -> dict:
-    if not isinstance(v, dict): return {}
-    return {k: v for k, v in v.items() if k not in CURSOR_KEYS}
-
-def soft_refetch_form_and_cursor(driver, form, effective_template):
-    try:
-        base = json.loads(form.get("variables", "{}"))
-    except Exception:
-        base = {}
-    # ghép lại template (không chứa cursor) rồi bỏ cursor hoàn toàn
-    base = merge_vars(base, effective_template)
-    base = strip_cursors_from_vars(base)
-
-    new_form = dict(form)
-    new_form["variables"] = json.dumps(base, separators=(",", ":"))
-
-    txt = js_fetch_in_page(driver, new_form, extra_headers={})
-    obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
-    if not obj:
-        return None, None, None, None
-
-    cursors = deep_collect_cursors(obj)
-    new_has_next = deep_find_has_next(obj)
-    if new_has_next is None:
-        new_has_next = bool(cursors)
-    new_cursor = cursors[0][1] if cursors else None
-    return new_form, new_cursor, new_has_next, obj
+from get_info import _all_urls_from_text
+from get_info import _dig_attachment_urls
 
 # =========================
-# CONFIG — nhớ sửa GROUP_URL
+# CONFIG — chỉnh theo máy bạn
 # =========================
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
-REMOTE_PORT   = 9222
 
-# GROUP_URL     = "https://web.facebook.com/groups/laptrinhvienit"  # <— ĐỔI Ở ĐÂY
-GROUP_URL     = "https://www.facebook.com/thoibao.de"  # <— ĐỔI Ở ĐÂY
+HERE = Path(__file__).resolve().parent
+
+# Page/Group/Profile gốc bạn muốn crawl
+GROUP_URL     = "https://www.facebook.com/thoibao.de"
+
+# (Optional) Nếu muốn nạp login thủ công từ file, set path 2 hằng dưới; nếu không, để None:
+COOKIES_PATH         = HERE / "authen" / "cookies.json"
+LOCALSTORAGE_PATH    = HERE / "authen" / "localstorage.json"
+SESSIONSTORAGE_PATH  = HERE / "authen" / "sessionstorage.json"
+
+# Proxy tuỳ chọn cho selenium-wire (để trống nếu không dùng)
+PROXY_URL = ""
+
+# Lưu trữ
 KEEP_LAST     = 350
 OUT_NDJSON    = "posts_all.ndjson"
 RAW_DUMPS_DIR = "raw_dumps"
-
-CHECKPOINT    = r"checkpoint.json"
+CHECKPOINT    = "checkpoint.json"
 
 os.makedirs(RAW_DUMPS_DIR, exist_ok=True)
-
-# =========================
-# Boot
-# =========================
-def _wait_port(host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
-    """Return True if (host,port) becomes connectable within timeout."""
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            with socket.create_connection((host, port), timeout=1):
-                return True
-        except Exception:
-            time.sleep(poll)
-    return False
-
-def start_driver(chrome_path,
-                 user_data_dir,
-                 profile_name,
-                 port=9222,
-                 headless: bool = True,
-                 timeout: float = 15.0):
-    """
-    Start a real Chrome process and attach Selenium via remote debugging.
-
-    Args:
-        chrome_path: path to chrome/chromium executable.
-        user_data_dir: profile dir (keeps cookies/session).
-        profile_name: profile directory name (e.g. 'Default' or 'Profile 1').
-        port: remote debugging port.
-        headless: if True, start Chrome in headless (background) mode.
-        timeout: seconds to wait for remote port to become available.
-
-    Returns:
-        webdriver.Chrome instance (connected to the launched Chrome).
-    """
-    # build CLI args for Chrome instance
-    # keep remote-debugging-port + user profile. Add headless flags optionally.
-    args = [
-        chrome_path,
-        f'--remote-debugging-port={port}',
-        f'--user-data-dir={user_data_dir}',
-        f'--profile-directory={profile_name}',
-        # useful flags to make an isolated, stable environment:
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--disable-extensions',
-        '--disable-background-networking',
-        '--disable-popup-blocking',
-        '--disable-default-apps',
-        '--disable-infobars'
-    ]
-
-    if headless:
-        # prefer new headless mode; adjust window size
-        args += [
-            '--headless=new',
-            '--disable-gpu',
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--window-size=1920,1080'
-        ]
-
-    # Launch Chrome (separate process) that Selenium will attach to.
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Wait for remote debugging port to be ready
-    ok = _wait_port('127.0.0.1', port, timeout=timeout)
-    if not ok and headless:
-        # fallback: try again without headless (some sites require non-headless)
-        proc.kill()
-        time.sleep(0.5)
-        # try non-headless
-        args = [
-            chrome_path,
-            f'--remote-debugging-port={port}',
-            f'--user-data-dir={user_data_dir}',
-            f'--profile-directory={profile_name}',
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-popup-blocking',
-            '--disable-default-apps',
-            '--disable-infobars',
-            '--window-size=1920,1080'
-        ]
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        ok = _wait_port('127.0.0.1', port, timeout=timeout)
-        if not ok:
-            proc.kill()
-            raise RuntimeError(f"Chrome remote debugging port {port} not available after fallback start.")
-
-    if not ok:
-        proc.kill()
-        raise RuntimeError(f"Chrome remote debugging port {port} not available.")
-
-    # Attach Selenium to the running Chrome via debuggerAddress
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-
-    # Important: do NOT also set options.headless here — we're attaching to the launched Chrome.
-    driver = webdriver.Chrome(options=options)
-    
-    return driver
 
 # =========================
 # Hook /api/graphql/
@@ -168,8 +62,8 @@ def install_early_hook(driver, keep_last=KEEP_LAST):
         if (!h) return {};
         if (h instanceof Headers){const o={}; h.forEach((v,k)=>o[k]=v); return o;}
         if (Array.isArray(h)){const o={}; for (const [k,v] of h) o[k]=v; return o;}
-        return (typeof h==='object')?h:{};
-      }catch(e){return {}}}
+        return (typeof h==='object')?h:{};}catch(e){return {}}
+      }
       function pushRec(rec){try{
         const q = window.__gqlReqs; q.push(rec);
         if (q.length > __KEEP_LAST__) q.splice(0, q.length - __KEEP_LAST__);
@@ -186,8 +80,7 @@ def install_early_hook(driver, keep_last=KEEP_LAST):
         }
         const res = await origFetch(input, init);
         if (rec){
-          try{ rec.responseText = await res.clone().text(); }
-          catch(e){ rec.responseText = null; }
+          try{ rec.responseText = await res.clone().text(); }catch(e){ rec.responseText = null; }
           pushRec(rec);
         }
         return res;
@@ -211,9 +104,6 @@ def install_early_hook(driver, keep_last=KEEP_LAST):
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": HOOK_SRC})
     driver.execute_script(HOOK_SRC)
 
-# =========================
-# Buffer helpers
-# =========================
 def gql_count(d): return d.execute_script("return (window.__gqlReqs||[]).length")
 def get_gql_at(d, i): return d.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
 
@@ -230,30 +120,200 @@ def wait_next_req(d, start_idx, matcher, timeout=25, poll=0.25):
     return None
 
 # =========================
-# Matching + parsing
+# Chrome + selenium-wire
 # =========================
-def parse_form(body_str):
+def _wait_port(host: str, port: int, timeout: float = 20.0, poll: float = 0.1) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except Exception:
+            time.sleep(poll)
+    return False
+
+def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver.Chrome:
+    chrome_opts = Options()
+    if headless:
+        chrome_opts.add_argument("--headless=new")
+        chrome_opts.add_argument("--disable-gpu")
+    chrome_opts.add_argument("--no-sandbox")
+    chrome_opts.add_argument("--disable-dev-shm-usage")
+    chrome_opts.add_argument("--window-size=1920,1080")
+    chrome_opts.add_argument("--disable-extensions")
+    chrome_opts.add_argument("--disable-background-networking")
+    chrome_opts.add_argument("--disable-popup-blocking")
+    chrome_opts.add_argument("--no-first-run")
+    chrome_opts.add_argument("--no-default-browser-check")
+    chrome_opts.add_argument("--disable-background-timer-throttling")
+    chrome_opts.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_opts.add_argument("--disable-renderer-backgrounding")
+
+    sw_options = None
+    if proxy_url:
+        sw_options = {
+            "proxy": {
+                "http":  proxy_url,
+                "https": proxy_url,
+                "no_proxy": "localhost,127.0.0.1",
+            },
+            # "verify_ssl": False,
+        }
+
+    driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
+    driver.scopes = [r".*"]
+    return driver
+
+# =========================
+# bootstrap_auth — nạp cookies/localStorage nếu có
+# =========================
+ALLOWED_COOKIE_DOMAINS = {".facebook.com", "facebook.com", "m.facebook.com", "web.facebook.com"}
+
+def _coerce_epoch(v):
+    try:
+        vv = float(v)
+        if vv > 10_000_000_000:  # ms -> s
+            vv = vv / 1000.0
+        return int(vv)
+    except Exception:
+        return None
+
+def _normalize_cookie(c: dict) -> Optional[dict]:
+    if not isinstance(c, dict): 
+        return None
+    name  = c.get("name")
+    value = c.get("value")
+    if not name or value is None:
+        return None
+
+    domain = c.get("domain")
+    host_only = c.get("hostOnly", False)
+    if domain:
+        domain = domain.strip()
+        if host_only and domain.startswith("."):
+            domain = domain.lstrip(".")
+    if not domain:
+        domain = "facebook.com"
+
+    if not any(domain.endswith(d) or ("."+domain).endswith(d) for d in ALLOWED_COOKIE_DOMAINS):
+        return None
+
+    path = c.get("path") or "/"
+    secure    = bool(c.get("secure", True))
+    httpOnly  = bool(c.get("httpOnly", c.get("httponly", False)))
+
+    expiry = c.get("expiry", None)
+    if expiry is None:
+        expiry = c.get("expirationDate", None)
+    if expiry is None:
+        expiry = c.get("expires", None)
+    expiry = _coerce_epoch(expiry) if expiry is not None else None
+
+    out = {
+        "name": name,
+        "value": value,
+        "domain": domain,
+        "path": path,
+        "secure": secure,
+        "httpOnly": httpOnly,
+    }
+    if expiry is not None:
+        out["expiry"] = expiry
+    return out
+
+def _add_cookies_safely(driver, cookies_path: Path):
+    with open(cookies_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and "cookies" in raw:
+        raw = raw["cookies"]
+    if not isinstance(raw, list):
+        raise ValueError("File cookies không phải mảng JSON.")
+
+    added = 0
+    for c in raw:
+        nc = _normalize_cookie(c)
+        if not nc:
+            continue
+        try:
+            driver.add_cookie(nc)
+            added += 1
+        except Exception:
+            pass
+    return added
+
+def _set_kv_storage(driver, kv_path: Path, storage: str = "localStorage"):
+    with open(kv_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        for k, v in data.items():
+            driver.execute_script(f"{storage}.setItem(arguments[0], arguments[1]);", k, v)
+
+def bootstrap_auth(d):
+    d.get("https://www.facebook.com/")
+    time.sleep(1.0)
+
+    if COOKIES_PATH and os.path.exists(COOKIES_PATH):
+        try:
+            count = _add_cookies_safely(d, Path(COOKIES_PATH))
+            d.get("https://www.facebook.com/")
+            time.sleep(1.0)
+            print(f"[AUTH] Added cookies: {count}")
+        except Exception as e:
+            print("[WARN] bootstrap cookies:", e)
+
+    # if LOCALSTORAGE_PATH and os.path.exists(LOCALSTORAGE_PATH):
+    #     try:
+    #         d.get("https://www.facebook.com/")
+    #         _set_kv_storage(d, Path(LOCALSTORAGE_PATH), "localStorage")
+    #         d.get("https://www.facebook.com/")
+    #         time.sleep(0.8)
+    #     except Exception as e:
+    #         print("[WARN] bootstrap localStorage:", e)
+
+    # if SESSIONSTORAGE_PATH and os.path.exists(SESSIONSTORAGE_PATH):
+    #     try:
+    #         d.get("https://www.facebook.com/")
+    #         _set_kv_storage(d, Path(SESSIONSTORAGE_PATH), "sessionStorage")
+    #         d.get("https://www.facebook.com/")
+    #         time.sleep(0.8)
+    #     except Exception as e:
+    #         print("[WARN] bootstrap sessionStorage:", e)
+
+    try:
+        all_cookies = {c["name"]: c.get("value") for c in d.get_cookies()}
+        has_cuser = "c_user" in all_cookies
+        has_xs    = "xs" in all_cookies
+        print(f"[AUTH] c_user={has_cuser}, xs={has_xs}")
+    except Exception:
+        pass
+
+# =========================
+# Request matching / parsing
+# =========================
+def parse_form(body_str: str) -> Dict[str, str]:
     qs = urllib.parse.parse_qs(body_str, keep_blank_values=True)
-    return {k:(v[0] if isinstance(v, list) else v) for k,v in qs.items()}
+    return {k: (v[0] if isinstance(v, list) else v) for k, v in qs.items()}
 
 def is_group_feed_req(rec):
     if "/api/graphql/" not in (rec.get("url") or ""): return False
     if (rec.get("method") or "").upper() != "POST": return False
     body = rec.get("body") or ""
     if "fb_api_req_friendly_name=" in body:
-        if re.search(r"(?:GroupComet|CometGroup|GroupsComet).*(?:Feed|Stories).*Pagination", body, re.I):
+        if re.search(r"(?:GroupComet|CometGroup|GroupsComet|ProfileComet|Comet).*?(?:Feed|Timeline|Stories).*?(?:Pagination|Refetch)", body, re.I):
             return True
     try:
         v = parse_form(body).get("variables","")
         vj = json.loads(urllib.parse.unquote_plus(v))
-        if any(k in vj for k in ["groupID","groupIDV2","id"]) and any(
-            k in vj for k in ["after","cursor","endCursor","afterCursor","feedAfterCursor"]
-        ):
-            return True
+        if any(k in vj for k in ["groupID","groupIDV2","id","actorID","profileID","pageID"]):
+            if any(k in vj for k in ["after","cursor","endCursor","afterCursor","feedAfterCursor","beforeTime","afterTime"]):
+                return True
     except:
         pass
     return False
 
+# =========================
+# JSON helpers
+# =========================
 def _strip_xssi_prefix(s: str) -> str:
     if not s: return s
     s2 = s.lstrip()
@@ -286,9 +346,35 @@ def choose_best_graphql_obj(objs):
     return max(pick, key=lambda o: len(json.dumps(o, ensure_ascii=False)))
 
 # =========================
-# Cursor extract (tham lam)
+# Cursor / next helpers
 # =========================
 CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","feedAfterCursor","cursor"}
+
+def fetch_via_wire(driver, form):
+    url = "https://www.facebook.com/api/graphql/"
+    body = urlencode(form)
+    resp = driver.request(
+        "POST", url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://www.facebook.com",
+            "Referer": "https://www.facebook.com/"
+        },
+        timeout=25
+    )
+    return getattr(resp, "text", "")
+
+def current_cursor_from_form(form):
+    try:
+        v = json.loads(form.get("variables", "{}"))
+    except Exception:
+        return None
+    for k in ["cursor","after","endCursor","afterCursor","feedAfterCursor"]:
+        c = v.get(k)
+        if isinstance(c, str) and len(c) > 10:
+            return c
+    return None
 
 def deep_collect_cursors(obj):
     found = []
@@ -323,6 +409,7 @@ def deep_collect_cursors(obj):
 
 def deep_find_has_next(obj):
     res = []
+    o = obj
     def dive(o):
         if isinstance(o, dict):
             pi = o.get("page_info") or o.get("pageInfo")
@@ -332,346 +419,33 @@ def deep_find_has_next(obj):
             for v in o.values(): dive(v)
         elif isinstance(o, list):
             for v in o: dive(v)
-    dive(obj)
+    dive(o)
     if any(res): return True
     if res and not any(res): return False
     return None
 
-# =========================
-# Story collector + rid
-# =========================
-POST_URL_RE = re.compile(
-    r"""https?://(?:web\.)?facebook\.com/
-        (?:
-            groups/[^/]+/(?:permalink|posts)/\d+
-          | [A-Za-z0-9.\-]+/posts/\d+
-          | [A-Za-z0-9.\-]+/reel/\d+
-          | photo(?:\.php)?\?(?:.*(?:fbid|story_fbid|video_id)=\d+)
-          | .*?/pfbid[A-Za-z0-9]+
-        )
-    """, re.I | re.X
-)
-def filter_only_feed_posts(items):
-    keep = []
-    for it in items or []:
-        link = (it.get("link") or "").strip()
-        rid  = (it.get("rid")  or "").strip()
-        fbid = (it.get("id")   or "").strip()
-
-        ok_link = bool(link and POST_URL_RE.match(link))
-        ok_fbid = bool(fbid and fbid.startswith("Uzpf"))  # classic story ID
-        ok_rid  = bool(rid)
-
-        if ok_link or ok_fbid or ok_rid:
-            keep.append(it)
-    return keep
-def _get_text_from_node(n: dict):
-    if isinstance(n.get("message"), dict):
-        t = n["message"].get("text")
-        if t:
-            return t
-    if isinstance(n.get("body"), dict):
-        t = n["body"].get("text")
-        if t:
-            return t
-    return None
-def _is_story_node(n: dict) -> bool:
-    if n.get("__typename") == "Story": return True
-    if n.get("__isFeedUnit") == "Story": return True
-    if "post_id" in n or "comet_sections" in n: return True
-    return False
-
-def _looks_like_group_post(n: dict) -> bool:
-    if not _is_story_node(n): return False
-    url = n.get("wwwURL") or n.get("url") or ""
-    pid = n.get("id") or ""
-    if POST_URL_RE.match(url): return True
-    if (isinstance(pid, str) and pid.startswith("Uzpf")) or n.get("post_id"): return True
-    return False
-
-def _extract_url_digits(url: str):
-    if not url: return None
-    try:
-        path = urlparse(url).path.lower()
-    except:
-        path = url.lower()
-    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
-    if m: return m.group(1)
-    qs = parse_qs(urlparse(url).query)
-    for k in ("fbid","story_fbid","video_id","photo_id","id","v"):
-        v = qs.get(k)
-        if v and v[0] and v[0].isdigit():
-            return v[0]
-    return None
-
-# === replace collect_post_summaries bằng bản này ===
-def collect_post_summaries(obj, out, group_url=GROUP_URL):
-    if isinstance(obj, dict):
-        if _looks_like_group_post(obj):
-            post_id_api = obj.get("post_id")
-            fb_id      = obj.get("id")
-            url        = obj.get("wwwURL") or obj.get("url")
-            url_digits = _extract_url_digits(url)
-            rid        = post_id_api or url_digits or fb_id
-
-            # # author & type label
-            author_id, author_name, author_link, avatar, type_label = extract_author(obj)
-
-            text = _get_text_from_node(obj)
-
-            image_urls, video_urls = extract_media(obj)
-            counts = extract_reactions_and_counts(obj)
-            created = extract_created_time(obj)
-            is_share, link_share, type_share, origin_id = extract_share_flags(obj)
-            hashtags = extract_hashtags(text)
-            # author & type label
-            # author_id , author_name, author_link, avatar, type_label = None, None, None, None, None
-
-            # text = None
-
-            # image_urls, video_urls = None, None
-            # counts = None
-            # created = None
-            # is_share, link_share, type_share, origin_id = None, None, None, None
-            # hashtags = None
-            # # source_id (group id/slug best-effort)
-            source_id = None
-            _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
-            if _v: source_id = _v
-            if not source_id:
-                try:
-                    slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
-                    source_id = slug
-                except:
-                    pass
-            
-            out.append({
-                "id": fb_id,                 # <- id gốc nếu có
-                "rid": rid,                  # id dùng để dedupe
-                "type": type_label,          # "facebook page/profile/group"
-                "link": url,
-                "author_id": author_id,
-                "author": author_name,
-                "author_link": author_link,
-                "avatar": avatar,
-                "created_time": created,     # giữ epoch như mẫu
-                "content": text,
-                "image_url": image_urls,     # mảng
-                "like": counts["like"],
-                "comment": counts["comment"],
-                "haha": counts["haha"],
-                "wow": counts["wow"],
-                "sad": counts["sad"],
-                "love": counts["love"],
-                "angry": counts["angry"],
-                "care": counts["care"],
-                "share": counts["share"],
-                "hashtag": hashtags,         # mảng, lowercase
-                "video": video_urls,         # mảng
-                "source_id": source_id,
-                "is_share": is_share,
-                "link_share": link_share,
-                "type_share": type_share,
-            })
-        for v in obj.values():
-            collect_post_summaries(v, out, group_url)
-    elif isinstance(obj, list):
-        for v in obj:
-            collect_post_summaries(v, out, group_url)
-
-def _pick_text(a, b):
-    """Ưu tiên b nếu b 'tốt hơn' (không None, dài hơn)."""
-    if not b: 
-        return a
-    if not a:
-        return b
-    # ưu tiên chuỗi dài hơn (nhiều nội dung hơn)
-    return b if isinstance(b, str) and isinstance(a, str) and len(b) > len(a) else (b or a)
-
-def _pick_non_empty(a, b):
-    """Ưu tiên b nếu b không rỗng/None."""
-    return b if b not in (None, "", [], {}) else a
-
-def _merge_arrays(a, b):
+def deep_collect_timestamps(obj) -> List[int]:
+    keys_hint = {"creation_time","created_time","creationTime","createdTime"}
     out = []
-    seen = set()
-    for arr in (a or [], b or []):
-        for x in arr:
-            if x not in seen:
-                out.append(x); seen.add(x)
-    return out
-
-def _merge_counts(a, b, keys):
-    out = dict(a or {})
-    for k in keys:
-        out[k] = max((a or {}).get(k, 0), (b or {}).get(k, 0))
-    return out
-
-def _prefer_type(t1, t2):
-    """Ưu tiên type cụ thể hơn: page/profile/group > story."""
-    rank = {"facebook page": 3, "facebook profile": 3, "facebook group": 3, "story": 1, None: 0}
-    return t2 if rank.get(t2,0) >= rank.get(t1,0) else t1
-
-COUNT_KEYS = ["like","comment","haha","wow","sad","love","angry","care","share"]
-
-def merge_two_posts(a: dict, b: dict) -> dict:
-    if not a: return b or {}
-    if not b: return a or {}
-    m = dict(a)
-
-    # id/rid: giữ nguyên
-    m["id"]  = m.get("id")  or b.get("id")
-    m["rid"] = m.get("rid") or b.get("rid")
-
-    # type cụ thể hơn
-    m["type"] = _prefer_type(m.get("type"), b.get("type"))
-
-    # link/author fields: lấy cái có giá trị
-    m["link"]        = _pick_non_empty(m.get("link"),        b.get("link"))
-    m["author_id"]   = _pick_non_empty(m.get("author_id"),   b.get("author_id"))
-    m["author"]      = _pick_non_empty(m.get("author"),      b.get("author"))
-    m["author_link"] = _pick_non_empty(m.get("author_link"), b.get("author_link"))
-    m["avatar"]      = _pick_non_empty(m.get("avatar"),      b.get("avatar"))
-
-    # created_time: ưu tiên số lớn hơn (mới hơn)
-    ct_a, ct_b = m.get("created_time"), b.get("created_time")
-    try:
-        m["created_time"] = max(int(ct_a) if ct_a is not None else 0, int(ct_b) if ct_b is not None else 0) or (ct_a or ct_b)
-    except:
-        m["created_time"] = ct_a or ct_b
-
-    # content: ưu tiên nội dung dài hơn/đầy đủ hơn
-    m["content"] = _pick_text(m.get("content"), b.get("content"))
-
-    # media: union
-    m["image_url"] = _merge_arrays(m.get("image_url"), b.get("image_url"))
-    m["video"]     = _merge_arrays(m.get("video"),     b.get("video"))
-
-    # hashtag: union + đã lowercase sẵn
-    m["hashtag"] = _merge_arrays(m.get("hashtag"), b.get("hashtag"))
-
-    # counts: lấy max
-    counts_a = {k: m.get(k, 0) for k in COUNT_KEYS}
-    counts_b = {k: b.get(k, 0) for k in COUNT_KEYS}
-    counts   = _merge_counts(counts_a, counts_b, COUNT_KEYS)
-    m.update(counts)
-
-    # source_id: ưu tiên cái có giá trị
-    m["source_id"] = _pick_non_empty(m.get("source_id"), b.get("source_id"))
-
-    # share flags
-    m["is_share"]   = bool(m.get("is_share")) or bool(b.get("is_share"))
-    m["link_share"] = _pick_non_empty(m.get("link_share"), b.get("link_share"))
-    m["type_share"] = _pick_non_empty(m.get("type_share"), b.get("type_share"))
-
-    return m
-from urllib.parse import urlparse, parse_qs, urlunparse
-
-def _norm_link(u: str) -> str | None:
-    """Chuẩn hóa link để so trùng: bỏ query/fragment, chuẩn host, lower path, bỏ trailing slash."""
-    if not u or not isinstance(u, str): 
+    def as_epoch_s(x):
+        try:
+            v = int(x)
+            if v > 10_000_000_000: v //= 1000
+            if 1104537600 <= v <= 4102444800:  # 2005..2100
+                return v
+        except: pass
         return None
-    try:
-        p = urlparse(u)
-        # chuẩn host: web.facebook.com / m.facebook.com / www.facebook.com -> facebook.com
-        host = p.netloc.lower()
-        if host.endswith("facebook.com"):
-            host = "facebook.com"
-        # bỏ query/fragment
-        path = (p.path or "").rstrip("/")
-        return urlunparse(("https", host, path.lower(), "", "", ""))
-    except Exception:
-        return u
-
-def _extract_digits_from_fb_link(u: str) -> str | None:
-    """Lấy chuỗi số trong link post (permalink/posts/reel/...) nếu có."""
-    if not u: return None
-    try:
-        path = urlparse(u).path.lower()
-    except:
-        path = u.lower()
-    # /reel/<digits>, /posts/<digits>, /permalink/<digits>
-    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
-    return m.group(1) if m else None
-
-def _best_primary_key(it: dict) -> str | None:
-    """
-    Primary key để dedupe seen_ids:
-    - Ưu tiên rid nếu có & là dạng Uzpf... hoặc digits
-    - Nếu không, dùng id
-    - Nếu không, dùng digits từ link
-    - Nếu vẫn không, dùng normalized link
-    """
-    rid = it.get("rid")
-    _id = it.get("id")
-    link = it.get("link")
-    norm = _norm_link(link) if link else None
-    digits = _extract_digits_from_fb_link(link) if link else None
-
-    for k in (rid, _id):
-        if isinstance(k, str) and k.strip():
-            return k.strip()
-    return None
-def _all_join_keys(it: dict) -> list[str]:
-    """Tập khóa để GỘP: rid, id, digits từ link, normalized link."""
-    keys = []
-    rid = it.get("rid")
-    _id = it.get("id")
-    link = it.get("link")
-
-    keys = []
-    if isinstance(rid, str) and rid.strip(): keys.append(rid.strip())
-    if isinstance(_id,  str) and _id.strip(): keys.append(_id.strip())
-    return list(dict.fromkeys(keys))
-
-
-def coalesce_posts(items: list[dict]) -> list[dict]:
-    """
-    Gộp các record cùng post theo TẬP KHÓA {rid, id, digits(link), normalized_link}.
-    Nếu BẤT KỲ khóa nào trùng → merge vào cùng một group.
-    """
-    groups: dict[str, dict] = {}
-    key2group: dict[str, str] = {}
-    seq = 0
-
-    def _new_group_id() -> str:
-        nonlocal seq
-        seq += 1
-        return f"g{seq}"
-
-    for it in (items or []):
-        # Lấy toàn bộ khóa có thể join (rid, id, digits(link), qid, norm_link)
-        keys = _all_join_keys(it)  # yêu cầu bạn đã có sẵn hàm này
-
-        # tìm group hiện có nếu bất kỳ key nào đã thấy
-        gid = None
-        for k in keys:
-            if k in key2group:
-                gid = key2group[k]
-                break
-
-        # tạo mới hoặc merge
-        if gid is None:
-            gid = _new_group_id()
-            groups[gid] = it
-        else:
-            groups[gid] = merge_two_posts(groups[gid], it)  # yêu cầu bạn đã có sẵn hàm này
-
-        # cập nhật lại mapping cho TẤT CẢ key sau khi merge (để khóa mới sinh ra cũng map đúng)
-        merged_keys = _all_join_keys(groups[gid])
-        for k in merged_keys:
-            key2group[k] = gid
-
-    return list(groups.values())
-
-def filter_only_group_posts(items):
-    keep = []
-    for it in items:
-        url = (it.get("link") or "").strip()  # ĐỔI: dùng 'link' thay vì 'url'
-        fb_id = (it.get("id") or "").strip()
-        if POST_URL_RE.match(url) or (isinstance(fb_id, str) and fb_id.startswith("Uzpf")) or it.get("post_id"):
-            keep.append(it)
-    return keep
+    def dive(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in keys_hint:
+                    vv = as_epoch_s(v)
+                    if vv: out.append(vv)
+                dive(v)
+        elif isinstance(obj, list):
+            for v in obj: dive(v)
+    dive(obj)
+    return out
 
 # =========================
 # Variables template helpers
@@ -698,23 +472,10 @@ def merge_vars(base_vars, template_vars):
         out[k] = v
     return out
 
-# =========================
-# JS fetch with current page cookies
-# =========================
-def js_fetch_in_page(driver, form_dict, extra_headers=None):
-    script = """
-    const url = "/api/graphql/";
-    const form = arguments[0];
-    const extra = arguments[1] || {};
-    const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
-    const body = new URLSearchParams(form).toString();
-    return fetch(url, {method:"POST", headers, body, credentials:"include"}).then(r=>r.text());
-    """
-    return driver.execute_script(script, form_dict, extra_headers or {})
+def strip_cursors_from_vars(v: dict) -> dict:
+    if not isinstance(v, dict): return {}
+    return {k: v for k, v in v.items() if k not in CURSOR_KEYS}
 
-# =========================
-# Update variables for next cursor (template-aware)
-# =========================
 def update_vars_for_next_cursor(form: dict, next_cursor: str, vars_template: dict = None):
     try:
         base = json.loads(form.get("variables", "{}"))
@@ -735,69 +496,414 @@ def update_vars_for_next_cursor(form: dict, next_cursor: str, vars_template: dic
         base["count"] = max(base["count"], 10)
     form["variables"] = json.dumps(base, separators=(",", ":"))
     return form
-def try_refetch_reel_ufi(driver, base_form: dict, video_id: str, timeout=8.0):
+
+# =========================
+# JS fetch with page cookies
+# =========================
+def js_fetch_in_page(driver, form_dict, extra_headers=None, timeout_ms=20000):
     """
-    Dùng js_fetch_in_page để 'nhá' UFI cho video (reel) theo video_id.
-    Không hardcode doc_id; rely vào app preloaded ops.
-    Trả về dict counts hoặc {} nếu fail.
+    Chạy fetch ngay TRONG context page (giữ cookie), có timeout bằng AbortController.
+    Trả về text body. Ném RuntimeError nếu fail.
     """
-    if not video_id: 
-        return {}
+    script = r"""
+        const done = arguments[arguments.length - 1];
+        (async () => {
+          try {
+            const form = arguments[0] || {};
+            const extra = arguments[1] || {};
+            const timeout = arguments[2] || 20000;
 
-    # 1) Tạo payload giống form hiện tại nhưng variables chỉ chứa feedback target
-    vars_min = {"feedbackTargetID": video_id, "scale": 1}
-    form2 = dict(base_form)
-    form2["variables"] = json.dumps(vars_min, separators=(",", ":"))
+            const ctrl = new AbortController();
+            const to = setTimeout(() => ctrl.abort('timeout'), timeout);
 
-    # 2) Gọi 1 phát để app khởi động UFI resolver (nhiều bản GraphQL sẽ tự bind)
-    _ = js_fetch_in_page(driver, form2, extra_headers={})
+            const headers = Object.assign({"Content-Type":"application/x-www-form-urlencoded"}, extra);
+            const body = new URLSearchParams(form).toString();
 
-    # 3) Chờ trong buffer __gqlReqs tìm response có UFI (top_reactions/reaction_count)
-    start_idx = max(0, gql_count(driver) - 50)
-    def _ufi_req(rec):
-        if "/api/graphql/" not in (rec.get("url") or ""): return False
-        body = rec.get("body") or ""
-        # heuristics: có video_id + fields UFI
-        if video_id not in body:
-            return False
-        txt = rec.get("responseText") or ""
-        return ("top_reactions" in txt) or ("reaction_count" in txt) or ("total_comment_count" in txt)
+            if (!location.host.includes('facebook.com')) {
+              clearTimeout(to);
+              return done(JSON.stringify({ok:false, error:"bad_origin:"+location.href}));
+            }
 
-    hit = wait_next_req(driver, start_idx, _ufi_req, timeout=timeout, poll=0.25)
-    if not hit:
-        return {}
+            const res = await fetch("/api/graphql/", {
+              method: "POST",
+              headers,
+              body,
+              credentials: "include",
+              signal: ctrl.signal
+            });
 
-    _, req = hit
-    txt = req.get("responseText") or ""
+            const text = await res.text();
+            clearTimeout(to);
+            done(JSON.stringify({ok:true, status:res.status, text}));
+          } catch (e) {
+            done(JSON.stringify({ok:false, error: (e && e.message) ? e.message : String(e)}));
+          }
+        })();
+    """
+    driver.set_script_timeout(max(5, int(timeout_ms/1000) + 10))
+    raw = driver.execute_async_script(script, form_dict, extra_headers or {}, int(timeout_ms))
+    try:
+        obj = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        raise RuntimeError(f"js_fetch_in_page: bad_return {raw!r}")
+
+    if not obj.get("ok"):
+        raise RuntimeError(f"js_fetch_in_page: {obj.get('error')}")
+    return obj.get("text", "")
+
+# =========================
+# Soft-refetch & reload
+# =========================
+def soft_refetch_form_and_cursor(driver, form, vars_template):
+    try:
+        base = json.loads(form.get("variables", "{}"))
+    except Exception:
+        base = {}
+    base = merge_vars(base, vars_template)
+    base = strip_cursors_from_vars(base)
+
+    new_form = dict(form)
+    new_form["variables"] = json.dumps(base, separators=(",", ":"))
+
+    txt = js_fetch_in_page(driver, new_form, extra_headers={
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
     obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
     if not obj:
-        return {}
+        return None, None, None, None
 
-    # 4) Dò counts từ obj này (tái dùng parser)
-    counts = extract_reactions_and_counts(obj)
-    return counts or {}
+    cursors = deep_collect_cursors(obj)
+    new_has_next = deep_find_has_next(obj)
+    if new_has_next is None: 
+        new_has_next = bool(cursors)
+    new_cursor = cursors[0][1] if cursors else None
+
+    if new_cursor:
+        new_form = update_vars_for_next_cursor(new_form, new_cursor, vars_template)
+
+    return new_form, new_cursor, new_has_next, obj
+
+def reload_and_refresh_form(d, group_url, cursor, vars_template, timeout=25, poll=0.25):
+    d.get(group_url); time.sleep(1.5)
+    for _ in range(4):
+        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));"); time.sleep(0.5)
+    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=timeout, poll=poll)
+    if not nxt: return None, None, None
+    _, req = nxt
+    new_form = parse_form(req.get("body", ""))
+    friendly = urllib.parse.parse_qs(req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
+    new_doc_id = new_form.get("doc_id")
+    if cursor: new_form = update_vars_for_next_cursor(new_form, cursor, vars_template)
+    return new_form, friendly, new_doc_id
+
+def fast_forward_cursor(driver, form, vars_template, hops=2):
+    cur_form = form
+    last_cursor = None
+    for _ in range(max(1, hops)):
+        nf, nc, nh, _ = soft_refetch_form_and_cursor(driver, cur_form, vars_template)
+        if not nf or not nc: 
+            break
+        cur_form = nf
+        last_cursor = nc
+    return cur_form, last_cursor
+
+# =========================
+# Post collectors (ưu tiên rid + link + created_time)
+# =========================
+POST_URL_RE = re.compile(
+    r"""https?://(?:web\.)?facebook\.com/
+        (?:
+            groups/[^/]+/(?:permalink|posts)/\d+
+          | [A-Za-z0-9.\-]+/posts/\d+
+          | [A-Za-z0-9.\-]+/reel/\d+
+          | photo(?:\.php)?\?(?:.*(?:fbid|story_fbid|video_id)=\d+)
+          | .*?/pfbid[A-Za-z0-9]+
+        )
+    """, re.I | re.X
+)
+
+def _is_story_node(n: dict) -> bool:
+    if n.get("__typename") == "Story": return True
+    if n.get("__isFeedUnit") == "Story": return True
+    if "post_id" in n or "comet_sections" in n: return True
+    return False
+
+def _looks_like_group_post(n: dict) -> bool:
+    if not _is_story_node(n): return False
+    url = n.get("wwwURL") or n.get("url") or ""
+    pid = n.get("id") or ""
+    if POST_URL_RE.match(url): return True
+    if (isinstance(pid, str) and pid.startswith("Uzpf")) or n.get("post_id"): return True
+    return False
+
+def _extract_url_digits(url: str) -> Optional[str]:
+    if not url: return None
+    try:
+        path = urlparse(url).path.lower()
+    except:
+        path = url.lower()
+    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
+    if m: return m.group(1)
+    qs = parse_qs(urlparse(url).query)
+    for k in ("fbid","story_fbid","video_id","photo_id","id","v"):
+        v = qs.get(k)
+        if v and v[0] and v[0].isdigit():
+            return v[0]
+    return None
+
+def _dig_text(o):
+    texts = []
+    def take(x):
+        if isinstance(x, str):
+            t = x.strip()
+            if t and t.lower() not in {"see more", "xem thêm"}:
+                texts.append(t)
+    def dive(v):
+        if isinstance(v, dict):
+            if "text" in v and isinstance(v["text"], str): take(v["text"])
+            if "message" in v and isinstance(v["message"], dict):
+                if isinstance(v["message"].get("text"), str): take(v["message"]["text"])
+            if "body" in v and isinstance(v["body"], dict):
+                if isinstance(v["body"].get("text"), str): take(v["body"]["text"])
+            if "savable_description" in v and isinstance(v["savable_description"], dict):
+                if isinstance(v["savable_description"].get("text"), str): take(v["savable_description"]["text"])
+            for k in ("title", "subtitle", "headline", "label", "contextual_message"):
+                val = v.get(k)
+                if isinstance(val, dict) and isinstance(val.get("text"), str): take(val["text"])
+                elif isinstance(val, str): take(val)
+            for vv in v.values(): dive(vv)
+        elif isinstance(v, list):
+            for it in v: dive(it)
+    dive(o)
+    uniq, seen = [], set()
+    for t in texts:
+        if t not in seen:
+            uniq.append(t); seen.add(t)
+    return uniq
+
+def _extract_share_texts(n: dict):
+    actor_texts, attached_texts = [], []
+    if isinstance(n.get("message"), dict) and isinstance(n["message"].get("text"), str):
+        actor_texts.append(n["message"]["text"])
+    cs = n.get("comet_sections") or {}
+    if isinstance(cs, dict):
+        msg = cs.get("message")
+        if isinstance(msg, dict):
+            t = msg.get("text")
+            if isinstance(t, str) and t.strip():
+                actor_texts.append(t)
+        attached = cs.get("attached_story") or cs.get("content") or {}
+        if isinstance(attached, dict):
+            story = attached.get("story") if isinstance(attached.get("story"), dict) else attached
+            if isinstance(story, dict):
+                if isinstance(story.get("message"), dict) and isinstance(story["message"].get("text"), str):
+                    attached_texts.append(story["message"]["text"])
+                attached_texts.extend(_dig_text(story))
+    if not actor_texts:
+        actor_texts.extend(_dig_text(n))
+    def _uniq_keep(seq):
+        out, seen = [], set()
+        for s in seq:
+            s2 = s.strip()
+            if s2 and s2 not in seen:
+                out.append(s2); seen.add(s2)
+        return out
+    actor_texts = _uniq_keep(actor_texts)
+    attached_texts = _uniq_keep(attached_texts)
+    if actor_texts and attached_texts:
+        combined = actor_texts[0]
+        if combined not in attached_texts:
+            combined = combined + "\n\n" + attached_texts[0]
+    elif actor_texts:
+        combined = actor_texts[0]
+    elif attached_texts:
+        combined = attached_texts[0]
+    else:
+        combined = None
+    return (actor_texts[0] if actor_texts else None,
+            attached_texts[0] if attached_texts else None,
+            combined)
+
+def _get_text_from_node(n: dict):
+    _, _, combined = _extract_share_texts(n)
+    return combined
+
+def collect_post_summaries(obj, out, group_url=GROUP_URL):
+    if isinstance(obj, dict):
+        if _looks_like_group_post(obj):
+            post_id_api = obj.get("post_id")
+            fb_id      = obj.get("id")
+            url        = obj.get("wwwURL") or obj.get("url")
+            url_digits = _extract_url_digits(url)
+            rid        = post_id_api or url_digits or fb_id
+            author_id, author_name, author_link, avatar, type_label = extract_author(obj)
+
+            actor_text, attached_text, text_combined = _extract_share_texts(obj)
+            image_urls, video_urls = extract_media(obj)
+            counts = extract_reactions_and_counts(obj)
+            smart_is_share, smart_link, smart_type, origin_id, share_meta = extract_share_flags_smart(obj, actor_text or text_combined)
+            created_candidates = deep_collect_timestamps(obj)
+            created = max(created_candidates) if created_candidates else extract_created_time(obj)
+
+            is_share, link_share, type_share, origin_id_fallback = extract_share_flags(obj)
+            hashtags = extract_hashtags(text_combined)
+            out_links = list(dict.fromkeys(_all_urls_from_text(text_combined or "") + _dig_attachment_urls(obj)[0]))
+            out_domains = []
+            for u in out_links:
+                try:
+                    host = urlparse(u).netloc.lower().split(":")[0]
+                    if host: out_domains.append(host)
+                except: pass
+            out_domains = list(dict.fromkeys(out_domains))
+            source_id = None
+            _k, _v = deep_get_first(obj, {"group_id", "groupID", "groupIDV2"})
+            if _v: source_id = _v
+            if not source_id:
+                try:
+                    slug = re.search(r"/groups/([^/?#]+)", group_url).group(1)
+                    source_id = slug
+                except:
+                    pass
+
+            item = {
+                "id": fb_id,
+                "rid": rid,
+                "type": type_label,
+                "link": url,
+                "author_id": author_id,
+                "author": author_name,
+                "author_link": author_link,
+                "avatar": avatar,
+                "created_time": created,
+                "content": text_combined,
+                "image_url": image_urls,
+                "like": counts["like"],
+                "comment": counts["comment"],
+                "haha": counts["haha"],
+                "wow": counts["wow"],
+                "sad": counts["sad"],
+                "love": counts["love"],
+                "angry": counts["angry"],
+                "care": counts["care"],
+                "share": counts["share"],
+                "hashtag": hashtags,
+                "video": video_urls,
+                "source_id": source_id,
+                "is_share": smart_is_share,
+                "link_share": smart_link,
+                "type_share": smart_type,
+                "origin_id": origin_id,
+                "out_links": out_links,
+                "out_domains": out_domains,
+            }
+            if share_meta:
+                item["share_meta"] = share_meta
+            if smart_is_share:
+                item["content_parts"] = {
+                    "actor_text": actor_text,
+                    "attached_text": attached_text
+                }
+            out.append(item)
+        for v in obj.values():
+            collect_post_summaries(v, out, group_url)
+    elif isinstance(obj, list):
+        for v in obj:
+            collect_post_summaries(v, out, group_url)
+
+def filter_only_feed_posts(items):
+    keep = []
+    for it in items or []:
+        link = (it.get("link") or "").strip()
+        fb_id = (it.get("id") or "").strip()
+        rid = (it.get("rid") or "").strip()
+        if rid or (link and POST_URL_RE.match(link)) or (fb_id and fb_id.startswith("Uzpf")):
+            keep.append(it)
+    return keep
+
+# =========================
+# Dedupe/merge (rid + normalized link)
+# =========================
+def _norm_link(u: str) -> Optional[str]:
+    if not u or not isinstance(u, str):
+        return None
+    try:
+        p = urlparse(u)
+        host = p.netloc.lower()
+        if host.endswith("facebook.com"): host = "facebook.com"
+        path = (p.path or "").rstrip("/")
+        if re.search(r"/(?:reel|posts|permalink)/\d+$", path.lower()):
+            return urlunparse(("https", host, path.lower(), "", "", ""))
+        return None
+    except Exception:
+        return None
+
+def _all_join_keys(it: dict) -> List[str]:
+    keys, seen = [], set()
+    for k in (it.get("rid"), it.get("id"), _extract_url_digits(it.get("link") or ""), _norm_link(it.get("link") or "")):
+        if isinstance(k, str) and k and (k not in seen):
+            keys.append(k); seen.add(k)
+    return keys
+
+def _best_primary_key(it: dict) -> Optional[str]:
+    rid = it.get("rid"); link = it.get("link"); _id = it.get("id")
+    digits = _extract_url_digits(link) if link else None
+    norm   = _norm_link(link) if link else None
+    for k in (rid, _id, digits, norm):
+        if isinstance(k, str) and k.strip(): return k.strip()
+    return None
+
+def merge_two_posts(a: dict, b: dict) -> dict:
+    if not a: return b or {}
+    if not b: return a or {}
+    m = dict(a)
+    m["id"]   = m.get("id")   or b.get("id")
+    m["rid"]  = m.get("rid")  or b.get("rid")
+    m["link"] = m.get("link") or b.get("link")
+    ca, cb = m.get("created_time"), b.get("created_time")
+    try:
+        m["created_time"] = max(int(ca) if ca else 0, int(cb) if cb else 0) or (ca or cb)
+    except: m["created_time"] = ca or cb
+    return m
+
+def coalesce_posts(items: List[dict]) -> List[dict]:
+    groups, key2group, seq = {}, {}, 0
+    def _new_gid():
+        nonlocal seq; seq += 1; return f"g{seq}"
+    for it in (items or []):
+        keys = _all_join_keys(it)
+        gid = None
+        for k in keys:
+            if k in key2group:
+                gid = key2group[k]; break
+        if gid is None:
+            gid = _new_gid(); groups[gid] = it
+        else:
+            groups[gid] = merge_two_posts(groups[gid], it)
+        for k in _all_join_keys(groups[gid]):
+            key2group[k] = gid
+    return list(groups.values())
 
 # =========================
 # Checkpoint / Output
 # =========================
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT):
-        return {"cursor": None, "seen_ids": [], "last_doc_id": None, "last_query_name": None, "vars_template": {}, "ts": None}
+        return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
+                "mode": None, "slice_to": None, "slice_from": None, "year": None,
+                "page": None, "min_created": None}
     try:
         with open(CHECKPOINT, "r", encoding="utf-8") as f:
             return json.load(f)
     except:
-        return {"cursor": None, "seen_ids": [], "last_doc_id": None, "last_query_name": None, "vars_template": {}, "ts": None}
+        return {"cursor": None, "seen_ids": [], "vars_template": {}, "ts": None,
+                "mode": None, "slice_to": None, "slice_from": None, "year": None,
+                "page": None, "min_created": None}
 
-def save_checkpoint(cursor, seen_ids, last_doc_id=None, last_query_name=None, vars_template=None):
-    data = {
-        "cursor": cursor,
-        "seen_ids": list(seen_ids)[:200000],
-        "last_doc_id": last_doc_id,
-        "last_query_name": last_query_name,
-        "vars_template": vars_template or {},
-        "ts": datetime.datetime.now().isoformat(timespec="seconds")
-    }
+def save_checkpoint(**kw):
+    data = load_checkpoint()
+    data.update(kw)
+    data["ts"] = datetime.datetime.now().isoformat(timespec="seconds")
     with open(CHECKPOINT, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -807,198 +913,243 @@ def append_ndjson(items):
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
-# =========================
-# seen_ids migration (đảm bảo hợp với 'rid')
-# =========================
 def normalize_seen_ids(seen_ids):
-    # Ở bản cũ bạn có thể đã lưu 'id' thuần; bản mới dùng rid (post_id | urlDigits | id).
-    # Không có URL để suy ra digits, nên giữ nguyên chuỗi — Uzpf* vẫn match rid.
     return set(seen_ids or [])
-def reload_and_refresh_form(d, group_url, cursor, effective_template, timeout=25, poll=0.25):
-    """Reload trang, bắt lại 1 request feed mới để lấy form/doc_id/tokens mới,
-    rồi set lại variables theo cursor đang có và trả về form mới."""
-    d.get(group_url)
-    time.sleep(1.5)
-    for _ in range(4):
-        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));")
-        time.sleep(0.5)
-
-    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=timeout, poll=poll)
-    if not nxt:
-        return None, None, None  # không bắt được → để caller tự xử lý
-    _, req = nxt
-
-    new_form = parse_form(req.get("body", ""))
-    new_friendly = urllib.parse.parse_qs(req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
-    new_doc_id = new_form.get("doc_id")
-
-    # ghép lại variables dựa trên template + cursor hiện tại
-    new_form = update_vars_for_next_cursor(new_form, cursor, vars_template=effective_template)
-    return new_form, new_friendly, new_doc_id
 
 # =========================
-# MAIN
+# Paginate 1 window (NO time slice khi gọi từ cursor-only)
 # =========================
-if __name__ == "__main__":
-    d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT)
-    install_early_hook(d, keep_last=KEEP_LAST)
+def paginate_window(d, form, vars_template, seen_ids: set,
+                    t_from: Optional[int]=None, t_to: Optional[int]=None,
+                    page_limit: Optional[int]=None) -> Tuple[int, Optional[int], bool]:
+    last_good_cursor = current_cursor_from_form(form) or None
+    cursor_stall_rounds = 0
+    prev_cursor = None
 
-    d.get(GROUP_URL)
-    time.sleep(1.2)
-    for _ in range(6):
-        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));")
-        time.sleep(0.6)
-
-    # Bắt 1 request mới để lấy token/doc_id/variables mới (NHƯNG có thể bỏ qua parse page1)
-    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=25, poll=0.25)
-    if not nxt:
-        raise RuntimeError("Không bắt được request feed của group. Hãy cuộn thêm / kiểm tra quyền vào group.")
-    idx, first_req = nxt
-    form = parse_form(first_req.get("body", ""))
-    friendly    = urllib.parse.parse_qs(first_req.get("body", "")).get("fb_api_req_friendly_name", [""])[0]
-    last_doc_id = form.get("doc_id")
-    vars_now    = get_vars_from_form(form)
-    template_now= make_vars_template(vars_now)
-
-    # Load checkpoint
-    state = load_checkpoint()
-    seen_ids      = normalize_seen_ids(state.get("seen_ids", []))
-    cursor        = state.get("cursor")
-    vars_template = state.get("vars_template") or {}
-    total_written = 0
-
-    # Chọn template hiệu lực
-    effective_template = vars_template or template_now
-
-    # ======== NHÁY THẲNG NẾU CÓ CURSOR ========
-    if cursor:
-        print(f"[RESUME] Using saved cursor → jump directly. cursor={str(cursor)[:24]}..., friendly={friendly}")
-        has_next = True
-        page = 0
-    else:
-        # ======== CHẠY TRUYỀN THỐNG (CHƯA CÓ CURSOR) ========
-        raw0 = first_req.get("responseText") or ""
-        obj0 = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(raw0)))
-        if not obj0:
-            open(os.path.join(RAW_DUMPS_DIR, "page1_raw.txt"), "w", encoding="utf-8").write(raw0)
-            raise RuntimeError("Không parse được trang đầu; đã dump raw_dumps/page1_raw.txt")
-
-        page_posts = []
-        collect_post_summaries(obj0, page_posts)
-        page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
-
-
-        cursors = deep_collect_cursors(obj0)
-        has_next = deep_find_has_next(obj0)
-        if has_next is None:
-            has_next = bool(cursors)
-
-        end_cursor = cursors[0][1] if cursors else None
-        if end_cursor:
-            cursor = end_cursor
-
-        print(f"[DEBUG] page1 posts={len(page_posts)} | cursors={len(cursors)} | has_next={has_next} | pick={str(end_cursor)[:24] if end_cursor else None}")
-        print(f"[DEBUG] doc_id={form.get('doc_id')} | friendly={friendly}")
-
-        # ✅ SAU KHI GỘP: lọc fresh theo primary key (không phụ thuộc rid)
-        fresh = []
-        for p in page_posts:
-            pk = _best_primary_key(p)
-            if pk and pk not in seen_ids:
-                fresh.append(p)
-
-        if fresh:
-            append_ndjson(fresh)
-            # ✅ thêm TẤT CẢ join-keys vào seen_ids để khóa mọi biến thể
-            for p in fresh:
-                for k in _all_join_keys(p):
-                    seen_ids.add(k)
-            total_written += len(fresh)
-
-        print(f"[PAGE#1] got {len(page_posts)} (new {len(fresh)}), next={bool(has_next)}")
-
-        save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=template_now)
-        page = 1
-
-    # ======== PAGINATE (resume-first) ========
+    total_new = 0
+    min_created = None
     no_progress_rounds = 0
+
+    mode_str = "time" if (t_from is not None or t_to is not None) else "warmup"
+    if mode_str == "time":
+        print(f"[MODE] Time-slice window: from={t_from} to={t_to}")
+
+    if (t_from is not None) or (t_to is not None):
+        # không dùng trong cursor-only, nhưng giữ để tái sử dụng
+        base = json.loads(form.get("variables","{}")) if form.get("variables") else {}
+        known_keys = set(base.keys())
+        cand_after = "afterTime"  if "afterTime"  in known_keys else "after_time"
+        cand_before= "beforeTime" if "beforeTime" in known_keys else "before_time"
+        base = merge_vars(base, vars_template)
+        if t_from is not None:  base[cand_after]  = int(t_from)
+        if t_to   is not None:  base[cand_before] = int(t_to)
+        if "count" in base and isinstance(base["count"], int):
+            base["count"] = max(base["count"], 10)
+        form["variables"] = json.dumps(base, separators=(",", ":"))
+
+    page = 0
+    has_next = False
+    cursor_for_reload = None
+
     while True:
         page += 1
-        # if page == 20:
-        #     print(f"[PAGE#{page}] reached page limit 20, stop.")
-        #     break
-        if cursor:
-            form = update_vars_for_next_cursor(form, cursor, vars_template=effective_template)
+        max_tries = 3
+        last_err = None
+        for attempt in range(1, max_tries+1):
+            try:
+                txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                break
+            except (_SETimeout, RuntimeError) as e:
+                last_err = e
+                if "bad_origin:" in str(e):
+                    d.get(GROUP_URL); time.sleep(1.2)
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=20000)
+                        break
+                    except Exception:
+                        pass
+                print(f"[WARN] fetch page try {attempt}/{max_tries} failed: {e}")
+                time.sleep(random.uniform(0.8, 1.6))
 
-        txt = js_fetch_in_page(d, form, extra_headers={})
+                if attempt == 2:
+                    new_form, boot_cursor, boot_has_next, _ = soft_refetch_form_and_cursor(d, form, vars_template)
+                    if new_form:
+                        form = new_form
+                        if (t_from is not None) or (t_to is not None):
+                            base = json.loads(form.get("variables","{}")) if form.get("variables") else {}
+                            known_keys = set(base.keys())
+                            cand_after = "afterTime"  if "afterTime"  in known_keys else "after_time"
+                            cand_before= "beforeTime" if "beforeTime" in known_keys else "before_time"
+                            base = merge_vars(base, vars_template)
+                            if t_from is not None:  base[cand_after]  = int(t_from)
+                            if t_to   is not None:  base[cand_before] = int(t_to)
+                            form["variables"] = json.dumps(base, separators=(",", ":"))
+
+                if attempt == max_tries:
+                    form2, friendly2, docid2 = reload_and_refresh_form(d, GROUP_URL, None, vars_template)
+                    if form2:
+                        form = form2
+                        if (t_from is not None) or (t_to is not None):
+                            base = json.loads(form.get("variables","{}")) if form.get("variables") else {}
+                            known_keys = set(base.keys())
+                            cand_after = "afterTime"  if "afterTime"  in known_keys else "after_time"
+                            cand_before= "beforeTime" if "beforeTime" in known_keys else "before_time"
+                            base = merge_vars(base, vars_template)
+                            if t_from is not None:  base[cand_after]  = int(t_from)
+                            if t_to   is not None:  base[cand_before] = int(t_to)
+                            form["variables"] = json.dumps(base, separators=(",", ":"))
+                    try:
+                        txt = js_fetch_in_page(d, form, extra_headers={}, timeout_ms=25000)
+                        break
+                    except Exception:
+                        try:
+                            txt = fetch_via_wire(d, form)
+                            if txt: break
+                        except Exception:
+                            pass
+                        raise
+
         obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
-
-        with open(os.path.join(RAW_DUMPS_DIR, f"page{page}_obj.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(RAW_DUMPS_DIR, f"slice_{t_from or 'None'}_{t_to or 'None'}_p{page}.json"), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=2)
+
         if not obj:
-            open(os.path.join(RAW_DUMPS_DIR, f"page{page}_raw.txt"), "w", encoding="utf-8").write(txt)
-            print(f"[PAGE#{page}] parse fail → dumped raw, break.")
+            print(f"[SLICE {t_from}->{t_to}] parse fail → stop slice.")
             break
 
         page_posts = []
         collect_post_summaries(obj, page_posts)
         page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
 
-
-        cursors = deep_collect_cursors(obj)
-        has_next = deep_find_has_next(obj)
-        if has_next is None:
-            has_next = bool(cursors)
-
-        new_cursor = cursors[0][1] if cursors else None
-        if new_cursor:
-            cursor = new_cursor
-
-        # ✅ fresh theo primary key (pk), không chỉ rid
+        written_this_round = set()
         fresh = []
         for p in page_posts:
             pk = _best_primary_key(p)
-            if pk and pk not in seen_ids:
-                fresh.append(p)
+            if pk and (pk not in seen_ids) and (pk not in written_this_round):
+                fresh.append(p); written_this_round.add(pk)
 
-        # ✅ DEDUP trong vòng hiện tại theo pk
-        written_this_round = set()
-        fresh_dedup = []
-        for p in fresh:
-            pk = _best_primary_key(p)
-            if pk and pk not in written_this_round:
-                fresh_dedup.append(p)
-                written_this_round.add(pk)
-
-        if fresh_dedup:
-            append_ndjson(fresh_dedup)
-            # ✅ seen_ids: add toàn bộ join-keys
-            for p in fresh_dedup:
-                for k in _all_join_keys(p):
-                    seen_ids.add(k)
-            total_written += len(fresh_dedup)
+        if fresh:
+            append_ndjson(fresh)
+            for p in fresh:
+                for k in _all_join_keys(p): seen_ids.add(k)
+            total_new += len(fresh)
             no_progress_rounds = 0
         else:
             no_progress_rounds += 1
 
-        print(f"[PAGE#{page}] got {len(page_posts)} (new {len(fresh_dedup)}), total={total_written}, next={bool(has_next)} | cursor={str(cursor)[:24] if cursor else None}")
+        for p in page_posts:
+            ct = p.get("created_time")
+            if isinstance(ct, int):
+                if (min_created is None) or (ct < min_created):
+                    min_created = ct
 
-        save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'), last_query_name=friendly, vars_template=effective_template)
+        cursors = deep_collect_cursors(obj)
+        has_next = deep_find_has_next(obj)
+        if not fresh and has_next:
+            cursor_stall_rounds += 1
+        else:
+            cursor_stall_rounds = 0
+        if cursor_stall_rounds >= 6:
+            print("[STALL] next=True & fresh=0 nhiều vòng → fast-forward 2 hops")
+            ff_form, ff_cursor = fast_forward_cursor(d, form, vars_template, hops=2)
+            if ff_form:
+                form = ff_form
+                if ff_cursor:
+                    last_good_cursor = ff_cursor
+                    prev_cursor = ff_cursor
+            cursor_stall_rounds = 0
+            time.sleep(random.uniform(0.6, 1.0))
+            continue
 
-        # === NEW: nếu next=False liên tiếp nhiều lần thì soft-refetch không cần UI ===
+        if has_next is None: has_next = bool(cursors)
+        new_cursor = cursors[0][1] if cursors else None
+
+        if not fresh and new_cursor:
+            form = update_vars_for_next_cursor(form, new_cursor, vars_template)
+            last_good_cursor = new_cursor
+            prev_cursor = new_cursor
+            try:
+                v = json.loads(form.get("variables","{}"))
+                if isinstance(v.get("count"), int):
+                    v["count"] = min(max(v["count"] + 10, 20), 60)
+                    form["variables"] = json.dumps(v, separators=(",",":"))
+            except: 
+                pass
+            time.sleep(random.uniform(0.3, 0.6))
+            continue
+
+        if new_cursor:
+            cursor_for_reload = new_cursor
+        elif not cursor_for_reload:
+            cursor_for_reload = current_cursor_from_form(form)
+
+        if new_cursor and prev_cursor == new_cursor:
+            print(f"[WARN] cursor lặp lại → thử soft-refetch")
+            nf, bc, bh, _ = soft_refetch_form_and_cursor(d, form, vars_template)
+            if nf and (bc or bh):
+                form = nf
+                if bc:
+                    new_cursor = bc
+                    print(f"[FIX] lấy được cursor mới sau refetch.")
+            else:
+                f2, _, _ = reload_and_refresh_form(d, GROUP_URL, (last_good_cursor or current_cursor_from_form(form)), vars_template)
+                if f2:
+                    form = f2
+                    try:
+                        v = json.loads(form.get("variables","{}"))
+                        if isinstance(v.get("count"), int):
+                            v["count"] = min(max(v["count"] + 10, 20), 60)
+                            form["variables"] = json.dumps(v, separators=(",",":"))
+                    except:
+                        pass
+                    no_progress_rounds = 0
+                    time.sleep(random.uniform(0.8, 1.3))
+                    continue
+
+        if new_cursor:
+            last_good_cursor = new_cursor
+            prev_cursor = new_cursor
+
+        print(f"[SLICE {t_from or '-inf'}→{t_to or '+inf'}] p{page} got {len(page_posts)} (new {len(fresh)}), total_new={total_new}, next={has_next}")
+
+        save_checkpoint(
+            cursor=last_good_cursor,
+            seen_ids=list(seen_ids),
+            vars_template=vars_template,
+            mode=mode_str,
+            slice_from=t_from,
+            slice_to=t_to,
+            year=(datetime.datetime.utcfromtimestamp(t_to).year
+                  if (t_to and mode_str == "time") else None),
+            page=page,
+            min_created=min_created
+        )
+
         MAX_NO_NEXT_ROUNDS = 3
         if not has_next and no_progress_rounds >= MAX_NO_NEXT_ROUNDS:
             print(f"[PAGE#{page}] next=False x{no_progress_rounds} → soft-refetch doc_id/variables (no UI)")
-            # lưu checkpoint hiện tại để an toàn
-            save_checkpoint(cursor, seen_ids, last_doc_id=form.get('doc_id'),
-                            last_query_name=friendly, vars_template=effective_template)
+            if not cursor_for_reload:
+                cursor_for_reload = last_good_cursor or current_cursor_from_form(form)
 
-            # thử soft-refresh vài lần
+            save_checkpoint(
+                cursor=cursor_for_reload or last_good_cursor,
+                seen_ids=list(seen_ids),
+                vars_template=vars_template,
+                mode=mode_str,
+                slice_from=t_from,
+                slice_to=t_to,
+                year=(datetime.datetime.utcfromtimestamp(t_to).year
+                    if (t_to and mode_str == "time") else None),
+                page=page,
+                min_created=min_created
+            )
+
             refetch_ok = False
-            for attempt in range(1, 3):  # thử tối đa 2 lần
-                new_form, boot_cursor, boot_has_next, boot_obj = soft_refetch_form_and_cursor(d, form, effective_template)
+            for attempt in range(1, 3):
+                new_form, boot_cursor, boot_has_next, boot_obj = soft_refetch_form_and_cursor(
+                    d, form, vars_template
+                )
                 if new_form and (boot_cursor or boot_has_next):
-                    # cập nhật form + cursor mới và reset bộ đếm
                     form = new_form
                     if boot_cursor:
                         cursor = boot_cursor
@@ -1011,10 +1162,219 @@ if __name__ == "__main__":
 
             if not refetch_ok:
                 print(f"[PAGE#{page}] soft-refetch failed → stop pagination.")
-                break  # hoặc: quay về cơ chế reload UI thay vì break
+                break
 
-        time.sleep(random.uniform(0.7, 1.5))
+        if new_cursor:
+            form = update_vars_for_next_cursor(form, new_cursor, vars_template)
+            cursor_for_reload = new_cursor
 
+        if page_limit and page >= page_limit:
+            break
 
-    print(f"[DONE] wrote {total_written} posts → {OUT_NDJSON}")
-    print(f"[INFO] resume later with checkpoint: {CHECKPOINT}")
+        time.sleep(random.uniform(0.7, 1.4))
+
+    return total_new, min_created, bool(has_next)
+
+# =========================
+# Head-probe: bám đầu feed hiện tại
+# =========================
+def probe_head(driver, base_form, vars_template, k=5):
+    try:
+        v = json.loads(base_form.get("variables","{}"))
+    except: 
+        v = {}
+    v = strip_cursors_from_vars(merge_vars(v, vars_template))
+    form0 = dict(base_form); form0["variables"] = json.dumps(v, separators=(",",":"))
+
+    txt = js_fetch_in_page(driver, form0, extra_headers={
+        "Cache-Control": "no-cache", "Pragma": "no-cache",
+    })
+    obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+    if not obj: 
+        return None, [], None
+
+    page_posts = []
+    collect_post_summaries(obj, page_posts)
+    page_posts = coalesce_posts(filter_only_feed_posts(page_posts))
+    top = page_posts[:k]
+
+    cursors = deep_collect_cursors(obj)
+    head_cursor = cursors[0][1] if cursors else None
+
+    if head_cursor:
+        form1 = update_vars_for_next_cursor(form0, head_cursor, vars_template)
+    else:
+        form1 = form0
+
+    return form1, top, head_cursor
+
+# =========================
+# Runner: THUẦN CURSOR
+# =========================
+def strip_cursors_from_form_on_form(form, vars_template=None):
+    """
+    Tạo bản copy của form, loại bỏ tất cả các trường cursor/endCursor/after... trong phần variables.
+    Giữ lại các biến khác (ví dụ: id, count, scale, viewerID...).
+    """
+    import json
+
+    # Lấy ra biến variables từ form
+    try:
+        v = json.loads(form.get("variables", "{}"))
+    except Exception:
+        v = {}
+
+    # Các key cần xoá
+    CURSOR_KEYS = {
+        "cursor", "after", "endCursor", "afterCursor",
+        "feedAfterCursor", "before", "beforeCursor"
+    }
+
+    # Hàm đệ quy loại bỏ key trong dict con
+    def _strip(o):
+        if isinstance(o, dict):
+            new = {}
+            for k, val in o.items():
+                if k in CURSOR_KEYS:
+                    continue
+                new[k] = _strip(val)
+            return new
+        elif isinstance(o, list):
+            return [_strip(x) for x in o]
+        else:
+            return o
+
+    cleaned = _strip(v)
+
+    # Merge lại template (nếu có)
+    if vars_template:
+        try:
+            cleaned = merge_vars(cleaned, vars_template)
+        except Exception:
+            pass
+
+    # Trả lại form mới (copy)
+    new_form = dict(form)
+    new_form["variables"] = json.dumps(cleaned, separators=(",", ":"))
+    return new_form
+
+def run_cursor_only(d, form, vars_template, seen_ids, page_limit=None, resume=False):
+    """
+    Cursor-only paging. Nếu resume=True => KHÔNG boot ở head, đi thẳng từ checkpoint cursor.
+    """
+    total = 0
+
+    # === (A) HEAD-BOOT CHỈ KHI resume=False ===
+    if not resume:
+        fresh_head = 0
+        try:
+            # 1 nhát head nhanh để vớt bài siêu mới (tuỳ bạn giữ hay bỏ)
+            txt = js_fetch_in_page(d, strip_cursors_from_form_on_form(form, vars_template(form)), {}, 15000)  # pseudo
+            obj = choose_best_graphql_obj(iter_json_values(_strip_xssi_prefix(txt)))
+            buf = []
+            collect_post_summaries(obj, buf)
+            buf = coalesce_posts(filter_only_feed_posts(buf))
+            written = []
+            for p in buf:
+                pk = _best_primary_key(p)
+                if pk and pk not in seen_ids:
+                    written.append(p)
+                    for k in _all_join_keys(p): seen_ids.add(k)
+            append_ndjson(written)
+            fresh_head = len(written)
+            if fresh_head:
+                print(f"[HEAD] grabbed {fresh_head} fresh at head")
+        except Exception:
+            pass  # không quan trọng
+        total += fresh_head
+    else:
+        print("[RESUME] Skip head-probe; continue strictly from checkpoint cursor.")
+
+    # === (B) CHẠY PAGINATION THEO CURSOR ===
+    # Không set time window; để [-inf, +inf]
+    add, _, _ = paginate_window(
+        d, form, vars_template, seen_ids,
+        t_from=None, t_to=None,
+        page_limit=page_limit
+    )
+    total += add
+    return total
+
+# =========================
+# MAIN
+# =========================
+# from get_posts_fb_automation import start_driver
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true",
+                    help="Tiếp tục từ cursor trong checkpoint thay vì bám head.")
+    ap.add_argument("--page-limit", type=int, default=None,
+                    help="Giới hạn số trang để test (None = không giới hạn).")
+    args = ap.parse_args()
+
+    # CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    # USER_DATA_DIR = r"E:\NCS\Userdata"
+    # PROFILE_NAME  = "Profile 5"
+    # REMOTE_PORT   = 9222
+
+    # # Nếu bạn đã có start_driver(...), dùng nó; không thì đổi lại start_driver_with_proxy(PROXY_URL, headless=False)
+    # d = start_driver(
+    #     chrome_path=CHROME_PATH,
+    #     user_data_dir=USER_DATA_DIR,
+    #     profile_name=PROFILE_NAME,
+    #     port=REMOTE_PORT,
+    #     headless=False
+    # )
+    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    d.set_script_timeout(40)
+    try:
+        d.execute_cdp_cmd("Network.enable", {})
+        d.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+    except Exception:
+        pass
+
+    # Nếu đang dùng profile thật (USER_DATA_DIR), có thể bỏ bootstrap_auth.
+    bootstrap_auth(d)
+
+    try:
+        install_early_hook(d, keep_last=KEEP_LAST)
+    except Exception as e:
+        print("[WARN] install_early_hook:", e)
+
+    d.get(GROUP_URL); time.sleep(1.2)
+    for _ in range(6):
+        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.9));"); time.sleep(0.6)
+
+    nxt = wait_next_req(d, 0, is_group_feed_req, timeout=25, poll=0.25)
+    if not nxt:
+        raise RuntimeError("Không bắt được request feed. Hãy cuộn thêm/kiểm tra quyền.")
+    _, first_req = nxt
+    form         = parse_form(first_req.get("body", ""))
+    friendly     = urllib.parse.parse_qs(first_req.get("body","")).get("fb_api_req_friendly_name", [""])[0]
+    vars_now     = get_vars_from_form(form)
+    template_now = make_vars_template(vars_now)
+
+    state = load_checkpoint()
+    seen_ids      = normalize_seen_ids(state.get("seen_ids"))
+    cursor_ckpt   = state.get("cursor")                 # cursor đã lưu lần trước (last_good_cursor)
+    vars_template = state.get("vars_template") or template_now
+    effective_template = vars_template or template_now
+
+    # ✅ Resume đúng vị trí (nếu có --resume và có cursor trong checkpoint)
+    if args.resume and cursor_ckpt:
+        form = update_vars_for_next_cursor(form, cursor_ckpt, vars_template=effective_template)
+        print(f"[RESUME] Dùng lại cursor từ checkpoint: {str(cursor_ckpt)[:40]}...")
+
+    # 🔁 Chạy crawl theo cursor-only (không time-slice)
+    total_got = run_cursor_only(
+        d, form, effective_template, seen_ids,
+        page_limit=args.page_limit,
+        resume=args.resume   # ✅ quan trọng
+    )
+
+    # Lưu checkpoint cuối (giữ seen_ids & template; cursor đã được cập nhật trong quá trình paginate)
+    save_checkpoint(cursor=None, seen_ids=list(seen_ids), vars_template=effective_template,
+                    mode=None, slice_from=None, slice_to=None, year=None)
+    print(f"[DONE] total new written (cursor-only) = {total_got} → {OUT_NDJSON}")
