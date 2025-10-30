@@ -6,18 +6,6 @@ from selenium.webdriver.chrome.service import Service
 
 from get_comment_fb_utils import set_sort_to_all_comments
 
-# =========================
-# Config
-# =========================
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
-POST_URL      = "https://web.facebook.com/share/p/17W2LptXYM/"
-OUT_FILE      = "comments_batch1.json"
-
-# =========================
-# Boot & Hooks
-# =========================
 def _wait_port(host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
     """Return True if (host,port) becomes connectable within timeout."""
     end = time.time() + timeout
@@ -310,7 +298,6 @@ def extract_comments_from_resptext(resp_text):
     except:
         pass
     return texts, end_cursor, total, obj
-
 # =========================
 # UI interactions (scroll/click)
 # =========================
@@ -348,90 +335,41 @@ def scroll_to_last_comment(driver):
     """
     return bool(driver.execute_script(js))
 
+def wait_first_comment_request(driver, start_idx, timeout=10, poll=0.2):
+    end = time.time() + timeout
+    i = start_idx
+    print("Waiting for first comment request after index", start_idx)
+    
+    # while time.time() < end:
+    print("time.time() < end",time.time() < end)
+    n = driver.execute_script("return (window.__gqlReqs||[]).length")
+    print("n",n)
+    while i <= n:
+        rec = driver.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
+        i += 1
+        if rec and match_comment_req(rec):
+            return rec
+    time.sleep(poll)
+    # return None
+
 # =========================
-# MAIN
+# Replay GraphQL inside the page (keeps auth/cookies)
 # =========================
-if __name__ == "__main__":
-    d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME)
-    install_early_hook(d)
-
-    d.get(POST_URL)
-    time.sleep(2)
-    set_sort_to_all_comments(d)
-    hook_graphql(d)
-
-    # ép FB tạo UFI nếu chưa có
-    time.sleep(0.8)
-    for _ in range(3):
-        d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-        time.sleep(0.4)
-
-    # tìm request comment đầu để suy biến form (nếu cần)
-    all_reqs = d.execute_script("return window.__gqlReqs || []")
-    comm_reqs = [r for r in all_reqs if match_comment_req(r)]
-    if not comm_reqs:
-        try:
-            d.find_element(By.XPATH, "//div[contains(@aria-label,'Viết bình luận') or contains(@aria-label,'Write a comment')]")
-            time.sleep(0.6)
-        except: pass
-        for _ in range(5):
-            d.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(0.6)
-        all_reqs = d.execute_script("return window.__gqlReqs || []")
-        comm_reqs = [r for r in all_reqs if match_comment_req(r)]
-
-    if not comm_reqs:
-        print("[WARN] Chưa bắt trúng API comment. Mở đúng permalink & nhấn 'Xem thêm bình luận/ phản hồi'.")
-        json.dump(all_reqs, open("gql_all_dump.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-        raise SystemExit(0)
-
-    # Batch đầu tiên: đọc trực tiếp từ responseText (đã hook) thay vì replay
-    first_resptext = comm_reqs[0].get("responseText") or ""
-    texts, _, total_target, obj0 = extract_comments_from_resptext(first_resptext)
-    # Lưu batch đầu (để nguyên object đầu cho debug), có thể đổi sang chỉ lưu texts nếu muốn
-    json.dump(obj0, open(OUT_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-    print(f"[BATCH#1] comments extracted: {len(texts)}")
-
-    if not total_target:
-        total_target = max(10, len(texts))
-    print(f"[INFO] Target ≈ {total_target} comments")
-
-    baseline_idx = gql_count(d)
-    rounds, guard = 0, 200
-
-    while len(texts) < total_target and rounds < guard:
-        rounds += 1
-
-        # 1) click “Xem thêm …” nếu có, else kéo đến comment cuối
-        if click_view_more_if_any(d, max_clicks=1) == 0:
-            if not scroll_to_last_comment(d):
-                d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-        time.sleep(2)
-
-        # 2) đợi đúng 1 request comment mới
-        nxt = wait_next_comment_req(d, baseline_idx, timeout=8, poll=0.2)
-        if not nxt:
-            print(f"[{rounds}] Không thấy request mới sau khi cuộn/click, thử lại…")
-            continue
-
-        idx, req = nxt
-        baseline_idx = idx + 1
-
-        resp_text = req.get("responseText") or ""
-        batch_texts, _, maybe_total, _ = extract_comments_from_resptext(resp_text)
-        if batch_texts:
-            texts.extend(batch_texts)
-            print(f"[{rounds}] +{len(batch_texts)} → total={len(texts)}/{total_target}")
-        else:
-            print(f"[{rounds}] Parse OK nhưng không thấy text mới.")
-
-        if maybe_total:
-            total_target = maybe_total or total_target
-
-        # 3) lưu tiến độ (nhẹ nhàng, chỉ texts + target)
-        try:
-            json.dump({"texts": texts, "target": total_target}, open(OUT_FILE,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("[WARN] Không thể ghi file:", e)
-
-    print(f"[DONE] Collected {len(texts)} comments (target ~{total_target}). Saved to {OUT_FILE}")
+def graphql_post_in_page(driver, url: str, form_params: dict, override_vars: dict):
+    fp = dict(form_params)
+    fp["variables"] = json.dumps(override_vars, separators=(',',':'), ensure_ascii=False)
+    body = urllib.parse.urlencode(fp)
+    js = r"""
+    const url = arguments[0], body = arguments[1], cb = arguments[2];
+    fetch(url, {
+      method:'POST', credentials:'include',
+      headers:{'content-type':'application/x-www-form-urlencoded'},
+      body
+    }).then(r=>r.text()).then(t=>cb({ok:true,text:t}))
+      .catch(e=>cb({ok:false,err:String(e)}));
+    """
+    driver.set_script_timeout(120)
+    ret = driver.execute_async_script(js, url, body)
+    if not ret or not ret.get("ok"):
+        raise RuntimeError("Replay GraphQL failed: %s" % (ret and ret.get('err')))
+    return ret["text"]

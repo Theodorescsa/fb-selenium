@@ -2,7 +2,7 @@
 import datetime
 import json
 import re
-
+from get_comment_fb_utils import find_pageinfo_any
 
 _HASHTAG_RE = re.compile(r"(?:#|＃)([A-Za-z0-9_]+)", re.UNICODE)
 
@@ -418,7 +418,37 @@ def _reply_count(fb: dict, n: dict) -> int:
 
 
 def _iter_comment_nodes(root):
-    """Yield every node where __typename == 'Comment'."""
+    """
+    Yield top-level Comment nodes:
+      - data.node.comment_rendering_instance_for_feed_location.comments.edges[].node
+      - fallback: data.node.feedback.comment_rendering_instance.comments.edges[].node
+    Cuối cùng mới fallback quét toàn bộ.
+    """
+    # 1) Schema mới (Comet)
+    try:
+        cr = (root["data"]["node"]
+                  ["comment_rendering_instance_for_feed_location"]["comments"])
+        for edge in cr.get("edges", []):
+            n = edge.get("node")
+            if isinstance(n, dict) and n.get("__typename") == "Comment":
+                yield n
+        return
+    except Exception:
+        pass
+
+    # 2) Fallback schema cũ qua feedback
+    try:
+        tl = (root["data"]["node"]["feedback"]
+                   ["comment_rendering_instance"]["comments"])
+        for edge in tl.get("edges", []):
+            n = edge.get("node")
+            if isinstance(n, dict) and n.get("__typename") == "Comment":
+                yield n
+        return
+    except Exception:
+        pass
+
+    # 3) Fallback cuối: quét toàn bộ (ít ưu tiên)
     stack = [root]
     while stack:
         cur = stack.pop()
@@ -430,13 +460,7 @@ def _iter_comment_nodes(root):
         elif isinstance(cur, list):
             stack.extend(cur)
 
-
 def extract_full_posts_from_resptext(resp_text: str):
-    """
-    Trả về (rows, end_cursor, total, raw_obj)
-    - rows: unique-by-id, type='Comment', đã hợp nhất các field từ nhiều nhánh payload
-    - end_cursor/total: giống logic trước (nếu payload có)
-    """
     try:
         obj = json.loads(resp_text)
     except Exception:
@@ -449,8 +473,7 @@ def extract_full_posts_from_resptext(resp_text: str):
     for pay in payloads:
         # page/cursor
         try:
-            from get_comment_fb_utils import find_pageinfo_any as _find_pi
-            ec, hn = _find_pi(pay)
+            ec, hn = find_pageinfo_any(pay)
             if ec:
                 end_cursor = ec
             if hn is not None:

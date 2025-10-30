@@ -8,169 +8,133 @@ V2 – FB comments crawler via GraphQL replay (no continuous scrolling)
 - Bước 5: lưu checkpoint (cursor + vars_template + cursor_key + doc_id + friendly).
 """
 
-import json, time, re, urllib.parse, os
-from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-# =========================
-# UI interactions (scroll/click)
-# =========================
-def click_view_more_if_any(driver, max_clicks=1):
-    xps = [
-        "//div[@role='button'][contains(.,'Xem thêm bình luận') or contains(.,'Xem thêm phản hồi')]",
-        "//span[contains(.,'Xem thêm bình luận') or contains(.,'Xem thêm phản hồi')]/ancestor::div[@role='button']",
-        "//div[@role='button'][contains(.,'View more comments') or contains(.,'View more replies')]",
-        "//span[contains(.,'View more comments') or contains(.,'View more replies')]/ancestor::div[@role='button']",
-    ]
-    clicks = 0
-    for xp in xps:
-        for b in driver.find_elements(By.XPATH, xp):
-            if clicks >= max_clicks: return clicks
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
-                time.sleep(0.15)
-                b.click()
-                clicks += 1
-                time.sleep(0.35)
-            except: pass
-    return clicks
-
-def scroll_to_last_comment(driver):
-    js = r"""
-    (function(){
-      const cands = Array.from(document.querySelectorAll("div[role='article'][aria-label]"));
-      let nodes = cands.filter(n => /Bình luận/i.test(n.getAttribute('aria-label')||""));
-      if (nodes.length === 0) nodes = cands.filter(n => /(Comment|Comments)/i.test(n.getAttribute('aria-label')||""));
-      if (nodes.length === 0) return false;
-      nodes[nodes.length - 1].scrollIntoView({behavior: 'instant', block: 'center'});
-      window.scrollBy(0, Math.floor(window.innerHeight*0.1));
-      return true;
-    })();
+import json, time, urllib.parse, os, hashlib
+from extract_comment_utils import extract_full_posts_from_resptext
+from configs import *
+from get_comment_fb_utils import (
+                                 append_ndjson_line,
+                                 build_reply_vars,
+                                 clean_fb_resp_text,
+                                 detect_cursor_key,
+                                 load_checkpoint,
+                                 open_reel_comments_if_present,
+                                 save_checkpoint,
+                                 set_sort_to_all_comments,
+                                 strip_cursors_from_vars
+                                 )
+from get_comment_fb_automation import (
+                                 click_view_more_if_any,
+                                 graphql_post_in_page,
+                                 parse_form,
+                                 scroll_to_last_comment,
+                                 start_driver,
+                                 install_early_hook,
+                                 hook_graphql,
+                                 wait_first_comment_request)
+os.makedirs("raw_dumps", exist_ok=True)
+from collections import deque
+reply_jobs = deque()
+def crawl_replies_for_parent(driver, url, form, base_vars_template, parent_comment_id,
+                             out_json, extract_fn, clean_fn,
+                             max_reply_pages=None):
     """
-    return bool(driver.execute_script(js))
+    - driver/url/form: như phần top-level
+    - base_vars_template: vars_template 'sạch' (không cursor) của phần comments
+    - parent_comment_id: id comment cha
+    - out_json: file NDJSON
+    - extract_fn: ví dụ extract_full_posts_from_resptext
+    - clean_fn: ví dụ clean_fb_resp_text
+    """
 
-# =========================
-# Reuse helpers (cursor keys + parse)
-# =========================
-CURSOR_KEYS = {"end_cursor","endCursor","after","afterCursor","commentsAfterCursor","feedAfterCursor","cursor"}
+    pages = 0
+    current_cursor = None
+    seen_cursors = set()
+    seen_hash = set()
 
-def parse_form(body_str: str):
-    qs = urllib.parse.parse_qs(body_str, keep_blank_values=True)
-    return {k:(v[0] if isinstance(v, list) else v) for k,v in qs.items()}
+    while True:
+        pages += 1
+        if max_reply_pages and pages > max_reply_pages:
+            break
 
+        use_vars = build_reply_vars(base_vars_template, parent_comment_id, current_cursor)
 
+        raw_ret = graphql_post_in_page(driver, url, form, use_vars)
+        resp_text = raw_ret.get("text") if isinstance(raw_ret, dict) else raw_ret
 
-# =========================
-# Checkpoint
-# =========================
-def load_checkpoint(path="checkpoint_comments.json"):
-    if os.path.exists(path):
+        # parse/clean an toàn
         try:
-            return json.load(open(path,"r",encoding="utf-8"))
-        except: return {}
-    return {}
+            json.loads(resp_text)
+            cleaned = resp_text
+        except Exception:
+            cleaned = clean_fn(resp_text)
+            json.loads(cleaned)  # để raise nếu vẫn hỏng
 
-def save_checkpoint(data: dict, path="checkpoint_comments.json"):
-    tmp = path + ".tmp"
-    with open(tmp,"w",encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+        # extract replies từ response này
+        reply_items, end_cursor, _target, _extra = extract_fn(cleaned)
 
-# =========================
-# GraphQL capture + bootstrap
-# =========================
-def match_comment_req(rec: dict):
-    url = rec.get("url","")
-    if "/api/graphql/" not in url: return False
-    if rec.get("method") != "POST": return False
-    body = rec.get("body","") or ""
-    if "fb_api_req_friendly_name=" in body:
-        if "CommentsListComponentsPaginationQuery" in body: return True
-        elif "UFI2CommentsProviderPaginationQuery" in body: return True
-        elif re.search(r"fb_api_req_friendly_name=CometUFI[^&]*Comments[^&]*Pagination", body): return True
-    if "variables=" in body:
-        try:
-            v = parse_form(body).get("variables","")
-            vj = json.loads(urllib.parse.unquote_plus(v))
-            keys = set(vj.keys())
-            signs = {"commentable_object_id","commentsAfterCursor","feedLocation","focusCommentID","feedbackSource","after","afterCursor"}
-            if keys & signs: return True
-        except: pass
-    return False
-def wait_first_comment_request(driver, start_idx, timeout=10, poll=0.2):
-    end = time.time() + timeout
-    i = start_idx
-    print("Waiting for first comment request after index", start_idx)
-    
-    while time.time() < end:
-        print("time.time() < end",time.time() < end)
-        n = driver.execute_script("return (window.__gqlReqs||[]).length")
-        print("n",n)
-        while i <= n:
-            rec = driver.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
-            i += 1
-            if rec and match_comment_req(rec):
-                return rec
-        time.sleep(poll)
-    return None
+        # Ghi per-reply (dedupe theo nội dung)
+        new_cnt = 0
+        for i, it in enumerate(reply_items, 1):
+            if isinstance(it, dict):
+                txt = it.get("text") or it.get("message") or it.get("body")
+                # nếu extractor đã có id reply thì nên lấy ra ở đây để dedupe theo id
+                rid = it.get("id")
+            else:
+                txt, rid = str(it), None
 
+            txt = (txt or "").strip()
+            if not txt:
+                continue
 
+            # ưu tiên dedupe theo id nếu có; else theo hash nội dung
+            if rid:
+                key = f"id:{rid}"
+            else:
+                key = "md5:" + hashlib.md5(txt.encode("utf-8")).hexdigest()
 
-def strip_cursors_from_vars(v: dict) -> dict:
-    if not isinstance(v, dict): return {}
-    return {k: v for k, v in v.items() if k not in CURSOR_KEYS}
+            if key in seen_hash:
+                continue
+            seen_hash.add(key)
 
-def detect_cursor_key(original_vars: dict) -> str:
-    # Ưu tiên key cursor đang dùng trong variables ban đầu
-    for k in original_vars.keys():
-        if k in CURSOR_KEYS:
-            return k
-    # fallback hay gặp trong UFI
-    return "commentsAfterCursor"
+            append_ndjson_line(out_json, {
+                "is_reply": True,
+                "parent_id": parent_comment_id,
+                "page": pages,
+                "text": txt,
+                "reply_id": rid,
+                "cursor": end_cursor,
+                "ts": time.time()
+            })
+            new_cnt += 1
 
-# =========================
-# Replay GraphQL inside the page (keeps auth/cookies)
-# =========================
-def graphql_post_in_page(driver, url: str, form_params: dict, override_vars: dict):
-    fp = dict(form_params)
-    fp["variables"] = json.dumps(override_vars, separators=(',',':'), ensure_ascii=False)
-    body = urllib.parse.urlencode(fp)
-    js = r"""
-    const url = arguments[0], body = arguments[1], cb = arguments[2];
-    fetch(url, {
-      method:'POST', credentials:'include',
-      headers:{'content-type':'application/x-www-form-urlencoded'},
-      body
-    }).then(r=>r.text()).then(t=>cb({ok:true,text:t}))
-      .catch(e=>cb({ok:false,err:String(e)}));
-    """
-    driver.set_script_timeout(120)
-    ret = driver.execute_async_script(js, url, body)
-    if not ret or not ret.get("ok"):
-        raise RuntimeError("Replay GraphQL failed: %s" % (ret and ret.get('err')))
-    return ret["text"]
+        print(f"[V2-REPLIES] parent={parent_comment_id[:12]}… page {pages}: +{new_cnt}/{len(reply_items)}")
 
-# =========================
-# V2 main routine for comments
-# =========================
-def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="checkpoint_comments.json", max_pages=None):
-    """
-    Steps:
-    - Assume page is at permalink; sort set to All comments.
-    - Trigger exactly ONE scroll to cause first comment request.
-    - Capture the first comment request form -> vars_template (no cursor).
-    - If checkpoint has cursor+template, reuse; else init from this form.
-    - Replay GraphQL in a loop (no more scrolling) until has_next_page=False (or max_pages reached).
-    - Save texts + checkpoint each page.
-    """
+        # điều kiện dừng
+        if not end_cursor:
+            print("[V2-REPLIES] Hết trang replies (no end_cursor).")
+            break
+        if current_cursor and end_cursor == current_cursor:
+            print("[V2-REPLIES] Cursor không tiến → dừng.")
+            break
+        if end_cursor in seen_cursors:
+            print("[V2-REPLIES] Cursor lặp → dừng.")
+            break
+
+        seen_cursors.add(end_cursor)
+        current_cursor = end_cursor
+        
+def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoint_comments.json", max_pages=None):
+
     # 1) ensure one lightweight scroll to produce first request
     baseline = driver.execute_script("return (window.__gqlReqs||[]).length")
-    driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
+    # 1) click “Xem thêm …” nếu có, else kéo đến comment cuối
+    for _ in range(2):
+        if click_view_more_if_any(driver, max_clicks=1) == 0:  # FIX: dùng driver
+            if not scroll_to_last_comment(driver):             # FIX: dùng driver
+                driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
+        time.sleep(2)
 
-    time.sleep(1.0)
-
-    first_req = wait_first_comment_request(driver, 0, timeout=12, poll=0.2)
+    first_req = wait_first_comment_request(driver, baseline, timeout=12, poll=0.2)
 
     url = first_req.get("url")
     form = parse_form(first_req.get("body",""))
@@ -215,25 +179,108 @@ def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="chec
     all_texts = []
     pages = 0
     current_cursor = ck.get("cursor")
+    seen_text_hash = set()
+    seen_cursors = set()
+    reply_jobs = deque()  # NEW: hàng đợi crawl replies
 
     while True:
         pages += 1
         if max_pages and pages > max_pages:
             break
 
-        # compose variables = template + cursor(if any)
         use_vars = dict(vars_template)
-        use_vars.setdefault("commentsAfterCount", 50)  # 25–100 đều ok
+        use_vars.setdefault("commentsAfterCount", 50)
         if current_cursor:
             use_vars[cursor_key] = current_cursor
 
         # replay
-        resp_text = graphql_post_in_page(driver, url, form, use_vars)
-        batch_texts, end_cursor, total_target, _ = extract_full_posts_from_resptext(resp_text)
+        raw_ret = graphql_post_in_page(driver, url, form, use_vars)
+        resp_text = raw_ret.get("text") if isinstance(raw_ret, dict) else raw_ret
 
+        # parse “an toàn”
+        try:
+            json_resp = json.loads(resp_text)
+            cleaned = resp_text
+        except Exception as e:
+            cleaned = clean_fb_resp_text(resp_text)
+            json_resp = json.loads(cleaned)
+            os.makedirs("raw_dumps", exist_ok=True)
+            with open(f"raw_dumps/page{pages}.txt", "w", encoding="utf-8") as f:
+                f.write(resp_text)
+            print(f"[WARN] page {pages} parse fail:", e)
+            # không continue vì đã parse ok qua cleaned
+
+        # lưu JSON sạch để trace (optional)
+        with open(f"raw_dumps/page{pages}.json", "w", encoding="utf-8") as f:
+            json.dump(json_resp, f, ensure_ascii=False, indent=2)
+
+        # extract
+        batch_texts, end_cursor, total_target, extra = extract_full_posts_from_resptext(cleaned)
+
+        # stop if no next page
+        if not end_cursor:
+            print("[V2] Hết trang (không còn end_cursor).")
+            break
+
+        # guard: cursor không tiến hoặc lặp
+        if current_cursor and end_cursor == current_cursor:
+            print(f"[FUSE] cursor no-advance at page {pages} (cursor={current_cursor[:20]}...). Stop to avoid loop.")
+            break
+        if end_cursor in seen_cursors:
+            print(f"[FUSE] cursor repeated: {str(end_cursor)[:20]}... Stop.")
+            break
+        seen_cursors.add(end_cursor)
+
+        print(f"[DBG] cursor_key={cursor_key} current={str(current_cursor)[:24]}... next={str(end_cursor)[:24]}...")
+
+        # ✅ GHI THEO COMMENT — MỖI COMMENT 1 DÒNG + ENQUEUE REPLIES
         if batch_texts:
+            new_cnt = 0
+            for idx, item in enumerate(batch_texts, 1):
+                # lấy text
+                if isinstance(item, dict):
+                    txt = (
+                        item.get("text")
+                        or item.get("message")
+                        or item.get("body")
+                        or json.dumps(item, ensure_ascii=False)
+                    )
+                    # phát hiện replies
+                    parent_id = item.get("id")
+                    reply_count = item.get("comment") or item.get("reply_count") or 0
+                else:
+                    txt = str(item)
+                    parent_id, reply_count = None, 0
+
+                txt = (txt or "").strip()
+                if not txt:
+                    continue
+
+                # dedupe theo nội dung (tạm thời; nếu có id comment nên dedupe theo id)
+                h = hashlib.md5(txt.encode("utf-8")).hexdigest()
+                if h in seen_text_hash:
+                    continue
+                seen_text_hash.add(h)
+
+                # ghi NDJSON top-level
+                append_ndjson_line(out_json, {
+                    "is_reply": False,
+                    "parent_id": None,
+                    "page": pages,
+                    "index_in_page": idx,
+                    "text": txt,
+                    "cursor": end_cursor,
+                    "ts": time.time(),
+                    "target": total_target
+                })
+                new_cnt += 1
+
+                # enqueue replies nếu có
+                if parent_id and isinstance(reply_count, int) and reply_count > 0:
+                    reply_jobs.append(parent_id)
+
             all_texts.extend(batch_texts)
-            print(f"[V2] Page {pages}: +{len(batch_texts)} comments (cursor={bool(current_cursor)})")
+            print(f"[V2] Page {pages}: +{new_cnt}/{len(batch_texts)} comments (cursor={bool(current_cursor)})")
 
         # update checkpoint
         ck["cursor"] = end_cursor
@@ -242,47 +289,31 @@ def crawl_comments_v2(driver, out_json="comments_v2.json", checkpoint_path="chec
         ck["ts"] = time.time()
         save_checkpoint(ck, checkpoint_path)
 
-        # save progress
-        try:
-            json.dump({"texts": all_texts, "pages": pages, "target": total_target},
-                      open(out_json,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-        except Exception as e:
-            print("[WARN] Không thể ghi file:", e)
-
-        # stop if no next page
-        if not end_cursor:
-            print("[V2] Hết trang (không còn end_cursor).")
-            break
-
-        # advance
+        # ADVANCE cursor (chỉ 1 lần)
         current_cursor = end_cursor
 
-    print(f"[V2] DONE. Collected {len(all_texts)} comment texts → {out_json}. Checkpoint at {checkpoint_path}.")
+        # # === crawl replies cho các parent vừa phát hiện ===
+        # while reply_jobs:
+        #     pid = reply_jobs.popleft()
+        #     crawl_replies_for_parent(
+        #         driver,
+        #         url,
+        #         form,
+        #         vars_template,                 # base template đã strip cursor
+        #         parent_comment_id=pid,
+        #         out_json=out_json,
+        #         extract_fn=extract_full_posts_from_resptext,
+        #         clean_fn=clean_fb_resp_text,
+        #         max_reply_pages=None           # giới hạn nếu muốn (VD: 3)
+        #     )
+
+    print(f"[V2] DONE. Collected {len(all_texts)} comments → {out_json}. Checkpoint at {checkpoint_path}.")
     return all_texts
 
 # =========================
 # MAIN
 # =========================
-from extract_comment_utils import extract_full_posts_from_resptext
-from get_comment_fb_utils import (
-                                 set_sort_to_all_comments
-                                 )
-from get_comment_fb_automation import (
-                                 start_driver,
-                                 install_early_hook,
-                                 hook_graphql)
-CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
-POST_URL      = "https://web.facebook.com/share/p/17W2LptXYM/"
-OUT_FILE      = "comments_batch1.json"
-REMOTE_PORT  = 9222
 def scroll_element_by_xpath(driver, xpath, fraction=0.8):
-    """
-    Cuộn phần tử có scroll (scrollTop) theo tỉ lệ chiều cao của chính nó.
-    fraction: 0..1 (0.8 = cuộn ~80% chiều cao viewport của phần tử)
-    Return: True nếu cuộn được (scrollTop thay đổi), False nếu không scrollable.
-    """
     js = r"""
     const el = document.evaluate(arguments[0], document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
     if (!el) return {ok:false, reason:'not_found'};
@@ -308,20 +339,15 @@ if __name__ == "__main__":
     time.sleep(2)
     hook_graphql(d)
     time.sleep(0.5)
-
+    if "reel" in POST_URL:
+        open_reel_comments_if_present(d)
     set_sort_to_all_comments(d)
 
     # ép FB tạo UFI nếu chưa có
     time.sleep(0.8)
-        # 1) click “Xem thêm …” nếu có, else kéo đến comment cuối
-    for _ in range(4):
-        if click_view_more_if_any(d, max_clicks=1) == 0:
-            if not scroll_to_last_comment(d):
-                d.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-        time.sleep(2)
-    texts = crawl_comments_v2(
+    texts = crawl_comments(
         d,
-        out_json="comments_v2.json",
+        out_json="comments.ndjson",
         checkpoint_path="checkpoint_comments.json",
         max_pages=None  # hoặc đặt số trang tối đa để giới hạn
     )
