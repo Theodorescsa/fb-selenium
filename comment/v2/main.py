@@ -1,25 +1,16 @@
-# -*- coding: utf-8 -*-
-"""
-V2 – FB comments crawler via GraphQL replay (no continuous scrolling)
-- Bước 1: set sort "All comments" như cũ.
-- Bước 2: cuộn 1 lần để FB bắn 1 request comment đầu.
-- Bước 3: lấy request đó, tách form, lưu vars_template (bỏ cursor).
-- Bước 4: REPLAY GraphQL trong chính page context bằng fetch(), paginate bằng end_cursor.
-- Bước 5: lưu checkpoint (cursor + vars_template + cursor_key + doc_id + friendly).
-"""
-
+from collections import deque
 import json, time, urllib.parse, os, hashlib
-from extract_comment_utils import extract_full_posts_from_resptext
+from extract_comment_utils import extract_full_posts_from_resptext, extract_replies_from_depth1_resp
 from configs import *
 from get_comment_fb_utils import (
                                  append_ndjson_line,
-                                 build_reply_vars,
                                  clean_fb_resp_text,
+                                 collect_reply_tokens_from_json,
                                  detect_cursor_key,
                                  load_checkpoint,
                                  open_reel_comments_if_present,
                                  save_checkpoint,
-                                 set_sort_to_all_comments,
+                                 set_sort_to_all_comments_unified,
                                  strip_cursors_from_vars
                                  )
 from get_comment_fb_automation import (
@@ -32,97 +23,84 @@ from get_comment_fb_automation import (
                                  hook_graphql,
                                  wait_first_comment_request)
 os.makedirs("raw_dumps", exist_ok=True)
-from collections import deque
-reply_jobs = deque()
-def crawl_replies_for_parent(driver, url, form, base_vars_template, parent_comment_id,
-                             out_json, extract_fn, clean_fn,
-                             max_reply_pages=None):
-    """
-    - driver/url/form: như phần top-level
-    - base_vars_template: vars_template 'sạch' (không cursor) của phần comments
-    - parent_comment_id: id comment cha
-    - out_json: file NDJSON
-    - extract_fn: ví dụ extract_full_posts_from_resptext
-    - clean_fn: ví dụ clean_fb_resp_text
-    """
 
+REPLY_DOC_ID = "25396268633304296"  # từ payload của ông
+
+def crawl_replies_for_parent_expansion(
+    driver,
+    url,
+    form,
+    base_reply_vars,
+    parent_id,
+    parent_token,
+    out_json,
+    extract_fn,
+    clean_fn,
+    max_reply_pages=None
+):
     pages = 0
-    current_cursor = None
-    seen_cursors = set()
-    seen_hash = set()
+    current_token = parent_token
+
+    # clone form và sửa doc_id sang query reply
+    reply_form = dict(form)
+    reply_form["doc_id"] = REPLY_DOC_ID
+    # optional: cũng có thể sửa friendly name
+    reply_form["fb_api_req_friendly_name"] = "Depth1CommentsListPaginationQuery"
 
     while True:
         pages += 1
         if max_reply_pages and pages > max_reply_pages:
             break
 
-        use_vars = build_reply_vars(base_vars_template, parent_comment_id, current_cursor)
+        # build vars
+        use_vars = dict(base_reply_vars)
 
-        raw_ret = graphql_post_in_page(driver, url, form, use_vars)
+        # dọn mấy field của comment-level đi, cho sạch
+        use_vars.pop("commentsAfterCount", None)
+        use_vars.pop("commentsAfterCursor", None)
+        use_vars.pop("commentsBeforeCount", None)
+        use_vars.pop("commentsBeforeCursor", None)
+
+        # đây mới là cái reply cần
+        use_vars["id"] = parent_id               # ⚠️ giờ là FEEDBACK ID
+        use_vars["repliesAfterCount"] = 20
+        if current_token:
+            use_vars["expansionToken"] = current_token
+
+        raw_ret = graphql_post_in_page(driver, url, reply_form, use_vars)
         resp_text = raw_ret.get("text") if isinstance(raw_ret, dict) else raw_ret
 
-        # parse/clean an toàn
         try:
             json.loads(resp_text)
-            cleaned = resp_text
         except Exception:
-            cleaned = clean_fn(resp_text)
-            json.loads(cleaned)  # để raise nếu vẫn hỏng
+            resp_text = clean_fn(resp_text)
 
-        # extract replies từ response này
-        reply_items, end_cursor, _target, _extra = extract_fn(cleaned)
+        replies, next_token = extract_fn(resp_text, parent_id)
 
-        # Ghi per-reply (dedupe theo nội dung)
         new_cnt = 0
-        for i, it in enumerate(reply_items, 1):
-            if isinstance(it, dict):
-                txt = it.get("text") or it.get("message") or it.get("body")
-                # nếu extractor đã có id reply thì nên lấy ra ở đây để dedupe theo id
-                rid = it.get("id")
-            else:
-                txt, rid = str(it), None
-
-            txt = (txt or "").strip()
+        for r in replies:
+            txt = (r.get("content") or "").strip()
             if not txt:
                 continue
-
-            # ưu tiên dedupe theo id nếu có; else theo hash nội dung
-            if rid:
-                key = f"id:{rid}"
-            else:
-                key = "md5:" + hashlib.md5(txt.encode("utf-8")).hexdigest()
-
-            if key in seen_hash:
-                continue
-            seen_hash.add(key)
-
-            append_ndjson_line(out_json, {
+            rec = {
                 "is_reply": True,
-                "parent_id": parent_comment_id,
-                "page": pages,
+                "parent_id": parent_id,
                 "text": txt,
-                "reply_id": rid,
-                "cursor": end_cursor,
-                "ts": time.time()
-            })
+                "reply_id": r.get("id"),
+                "author": r.get("author"),
+                "page": pages,
+                "ts": time.time(),
+            }
+            append_ndjson_line(out_json, rec)
             new_cnt += 1
 
-        print(f"[V2-REPLIES] parent={parent_comment_id[:12]}… page {pages}: +{new_cnt}/{len(reply_items)}")
+        print(f"[V2-REPLIES] parent={parent_id[:12]}… page {pages}: +{new_cnt}/{len(replies)}")
 
-        # điều kiện dừng
-        if not end_cursor:
-            print("[V2-REPLIES] Hết trang replies (no end_cursor).")
-            break
-        if current_cursor and end_cursor == current_cursor:
-            print("[V2-REPLIES] Cursor không tiến → dừng.")
-            break
-        if end_cursor in seen_cursors:
-            print("[V2-REPLIES] Cursor lặp → dừng.")
+        if not next_token or next_token == current_token:
+            print("[V2-REPLIES] Hết trang replies (no new expansion_token).")
             break
 
-        seen_cursors.add(end_cursor)
-        current_cursor = end_cursor
-        
+        current_token = next_token
 def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoint_comments.json", max_pages=None):
 
     # 1) ensure one lightweight scroll to produce first request
@@ -201,6 +179,8 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
         try:
             json_resp = json.loads(resp_text)
             cleaned = resp_text
+            reply_token_map = {}
+            collect_reply_tokens_from_json(json_resp, reply_token_map)
         except Exception as e:
             cleaned = clean_fb_resp_text(resp_text)
             json_resp = json.loads(cleaned)
@@ -216,7 +196,11 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
 
         # extract
         batch_texts, end_cursor, total_target, extra = extract_full_posts_from_resptext(cleaned)
-
+        reply_jobs = deque()
+        if extra and isinstance(extra, dict):
+            for job in extra.get("reply_jobs", []):
+                # job kiểu: {"id": parent_comment_id, "token": expansion_token}
+                reply_jobs.append(job)
         # stop if no next page
         if not end_cursor:
             print("[V2] Hết trang (không còn end_cursor).")
@@ -255,7 +239,6 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
                 txt = (txt or "").strip()
                 if not txt:
                     continue
-
                 # dedupe theo nội dung (tạm thời; nếu có id comment nên dedupe theo id)
                 h = hashlib.md5(txt.encode("utf-8")).hexdigest()
                 if h in seen_text_hash:
@@ -277,7 +260,14 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
 
                 # enqueue replies nếu có
                 if parent_id and isinstance(reply_count, int) and reply_count > 0:
-                    reply_jobs.append(parent_id)
+                    info = reply_token_map.get(parent_id)
+                    if info:
+                        reply_jobs.append({
+                            "id": info["feedback_id"],   # <-- cái query reply cần
+                            "token": info["token"],
+                        })
+                    else:
+                        print(f"[REPLIES] comment {parent_id[:12]}… có {reply_count} replies nhưng KHÔNG thấy expansionToken/feedback_id → skip")
 
             all_texts.extend(batch_texts)
             print(f"[V2] Page {pages}: +{new_cnt}/{len(batch_texts)} comments (cursor={bool(current_cursor)})")
@@ -293,19 +283,24 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
         current_cursor = end_cursor
 
         # # === crawl replies cho các parent vừa phát hiện ===
-        # while reply_jobs:
-        #     pid = reply_jobs.popleft()
-        #     crawl_replies_for_parent(
-        #         driver,
-        #         url,
-        #         form,
-        #         vars_template,                 # base template đã strip cursor
-        #         parent_comment_id=pid,
-        #         out_json=out_json,
-        #         extract_fn=extract_full_posts_from_resptext,
-        #         clean_fn=clean_fb_resp_text,
-        #         max_reply_pages=None           # giới hạn nếu muốn (VD: 3)
-        #     )
+        while reply_jobs:
+            job = reply_jobs.popleft()
+            parent_id = job["id"]
+            parent_token = job.get("token")  # có thể None với mấy comment ít reply
+
+            crawl_replies_for_parent_expansion(
+                driver,
+                url,
+                form,
+                base_reply_vars=vars_template,   # ⚠️ dùng template đã strip cursor, KO dùng orig_vars
+                parent_id=parent_id,
+                parent_token=parent_token,
+                out_json=out_json,
+                extract_fn=extract_replies_from_depth1_resp,
+                clean_fn=clean_fb_resp_text,
+                max_reply_pages=None
+            )
+
 
     print(f"[V2] DONE. Collected {len(all_texts)} comments → {out_json}. Checkpoint at {checkpoint_path}.")
     return all_texts
@@ -341,7 +336,7 @@ if __name__ == "__main__":
     time.sleep(0.5)
     if "reel" in POST_URL:
         open_reel_comments_if_present(d)
-    set_sort_to_all_comments(d)
+    set_sort_to_all_comments_unified(d)
 
     # ép FB tạo UFI nếu chưa có
     time.sleep(0.8)

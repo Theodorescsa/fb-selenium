@@ -2,10 +2,6 @@ import json, time, urllib.parse, subprocess, re, socket
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-
-from get_comment_fb_utils import set_sort_to_all_comments
-
 def _wait_port(host: str, port: int, timeout: float = 15.0, poll: float = 0.1) -> bool:
     """Return True if (host,port) becomes connectable within timeout."""
     end = time.time() + timeout
@@ -373,3 +369,4 @@ def graphql_post_in_page(driver, url: str, form_params: dict, override_vars: dic
     if not ret or not ret.get("ok"):
         raise RuntimeError("Replay GraphQL failed: %s" % (ret and ret.get('err')))
     return ret["text"]
+

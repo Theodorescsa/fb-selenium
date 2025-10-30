@@ -560,3 +560,97 @@ def extract_full_posts_from_resptext(resp_text: str):
 
     rows = list(by_id.values())
     return rows, end_cursor, total, obj
+def extract_replies_from_depth1_resp(resp_text, parent_comment_id):
+    try:
+        resp = json.loads(resp_text)
+    except Exception:
+        return [], None
+
+    data = resp.get("data", {})
+    node = data.get("node", {})  # đây là Feedback trong file ông
+    out = []
+    next_token = None
+
+    # ===== CASE 1: kiểu cũ có comment_rendering_instance_for_feed_location =====
+    cri = node.get("comment_rendering_instance_for_feed_location")
+    if cri:
+        comments = (cri.get("comments") or {})
+        edges = comments.get("edges") or []
+        for edge in edges:
+            c = (edge.get("node") or {})
+            cid = c.get("id")
+            if cid != parent_comment_id:
+                continue
+
+            fb = c.get("feedback") or {}
+            exp_info = fb.get("expansion_info") or {}
+            next_token = exp_info.get("expansion_token") or exp_info.get("expansionToken")
+
+            replies_block = (
+                fb.get("comment_replies")
+                or fb.get("threaded_comments")
+                or {}
+            )
+            r_edges = replies_block.get("edges") or []
+            for r_edge in r_edges:
+                r = (r_edge.get("node") or {})
+                rid = r.get("id")
+                body = ""
+                if isinstance(r.get("body"), dict):
+                    body = r["body"].get("text") or ""
+                else:
+                    body = r.get("content") or ""
+                author = ((r.get("author") or {}).get("name")) or None
+                out.append({
+                    "id": rid,
+                    "content": body,
+                    "author": author,
+                })
+
+        return out, next_token
+
+    # ===== CASE 2: kiểu như file ông upload: node là Feedback =====
+    # data.node.replies_connection.edges[*].node chính là reply
+    if node.get("__typename") == "Feedback":
+        rc = (node.get("replies_connection") or {})
+        edges = rc.get("edges") or []
+
+        for edge in edges:
+            rnode = (edge.get("node") or {})
+
+            # check có đúng là reply của thằng mình đang đào không
+            parent_ent = (
+                rnode.get("comment_parent")
+                or rnode.get("comment_direct_parent")
+                or {}
+            )
+            # if parent_ent.get("id") != parent_comment_id:
+            #     # không phải reply của thằng mình cần → bỏ
+            #     continue
+
+            # lấy token tiếp cho lần sau (nó nằm trong feedback của từng reply)
+            fb = rnode.get("feedback") or {}
+            exp_info = fb.get("expansion_info") or {}
+            token_here = exp_info.get("expansion_token") or exp_info.get("expansionToken")
+            if token_here:
+                next_token = token_here
+
+            # lấy nội dung
+            body = ""
+            if isinstance(rnode.get("body"), dict):
+                body = rnode["body"].get("text") or ""
+            else:
+                body = (rnode.get("preferred_body") or {}).get("text") or ""
+
+            author = ((rnode.get("author") or {}).get("name")) or None
+
+            out.append({
+                "id": rnode.get("id"),
+                "content": body,
+                "author": author,
+            })
+
+        return out, next_token
+
+    # không rơi vào case nào
+    return [], None

@@ -1,7 +1,6 @@
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support.ui import WebDriverWait as W
-
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException, ElementClickInterceptedException, StaleElementReferenceException
@@ -176,32 +175,6 @@ def choose_all_comments_scoped(driver, container, timeout=10):
     if not safe_click(driver, opt):
         raise ElementClickInterceptedException("Không click được option 'All comments'.")
     return True
-
-def set_sort_to_all_comments(driver, max_retry=2):
-    """
-    Public API: đặt filter về 'Tất cả bình luận' theo cách ổn định.
-    """
-    print("[SORT] Chọn 'Tất cả bình luận'...")
-    last_err = None
-    for _ in range(max_retry):
-        try:
-            dlg = get_post_dialog(driver, timeout=10)
-            open_sort_menu_scoped(driver, dlg, timeout=10)
-            choose_all_comments_scoped(driver, dlg, timeout=10)
-            return True
-        except Exception as e:
-            last_err = e
-            time.sleep(0.6)
-    if last_err:
-        raise last_err
-    return False
-
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait as _wait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import ElementClickInterceptedException, TimeoutException
-from selenium.webdriver.common.action_chains import ActionChains
-import time
 
 # ===== Text variants =====
 SORT_TEXTS = [
@@ -562,8 +535,6 @@ def match_comment_req(rec: dict):
             if keys & signs: return True
         except: pass
     return False
-import re, json
-
 
 def clean_fb_resp_text(resp_text: str) -> str:
     """
@@ -601,42 +572,45 @@ def clean_fb_resp_text(resp_text: str) -> str:
 
     return s.strip()
 
-
-import json, os
-
 def append_ndjson_line(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
         
-# === reply crawl helpers ===
-from collections import deque
-import hashlib, json, time
-
-REPLY_CURSOR_KEYS = ["commentsAfterCursor", "after", "repliesAfterCursor"]
-REPLY_COMMENT_ID_KEYS = ["commentID", "parentCommentID", "comment_id"]
-
 def choose_first_key(candidates):
     for k in candidates:
         return k  # lấy key đầu (đã sắp xếp theo ưu tiên)
     return None
 
-def build_reply_vars(base_template: dict, parent_comment_id: str, cursor: str | None):
-    vars_ = dict(base_template)
-    # common page size cho replies
-    vars_.setdefault("commentsAfterCount", 50)
+def collect_reply_tokens_from_json(json_resp, out_map):
+    """
+    Đi qua tree JSON, gom:
+    - comment node id  (Y29t...)
+    - feedback.id      (ZmVlZGJhY2s6...)
+    - feedback.expansion_info.expansion_token
+    rồi lưu vào out_map[comment_id] = {token:..., feedback_id:...}
+    """
+    if not isinstance(json_resp, dict):
+        return
 
-    # đặt parent comment id
-    cid_key = choose_first_key(REPLY_COMMENT_ID_KEYS)
-    if cid_key:
-        vars_[cid_key] = parent_comment_id
-    else:
-        # fallback rất hiếm khi cần
-        vars_["commentID"] = parent_comment_id
+    def walk(obj):
+        if isinstance(obj, dict):
+            # dạng mà ông dán:
+            # node -> feedback -> expansion_info -> expansion_token
+            if obj.get("__typename") == "Comment" and "feedback" in obj:
+                cmt_id = obj.get("id")
+                fb = obj.get("feedback") or {}
+                fb_id = fb.get("id")
+                exp = (fb.get("expansion_info") or {}).get("expansion_token")
+                if cmt_id and fb_id and exp:
+                    out_map[cmt_id] = {
+                        "token": exp,
+                        "feedback_id": fb_id,
+                    }
+            for v in obj.values():
+                walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v)
 
-    # cursor for replies
-    if cursor:
-        ckey = choose_first_key(REPLY_CURSOR_KEYS)
-        vars_[ckey or "commentsAfterCursor"] = cursor
-
-    return vars_
+    walk(json_resp)
