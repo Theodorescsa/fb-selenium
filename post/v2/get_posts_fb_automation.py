@@ -1312,6 +1312,12 @@ if __name__ == "__main__":
                     help="Tiếp tục từ cursor trong checkpoint thay vì bám head.")
     ap.add_argument("--page-limit", type=int, default=None,
                     help="Giới hạn số trang để test (None = không giới hạn).")
+    ap.add_argument("--backfill", action="store_true",
+                    help="Crawl ngược thời gian (ví dụ từ tháng 8/2015 đến tháng 6/2015).")
+    ap.add_argument("--from-month", type=int, default=None, help="Tháng bắt đầu (ví dụ: 8).")
+    ap.add_argument("--to-month", type=int, default=None, help="Tháng kết thúc (ví dụ: 6).")
+    ap.add_argument("--year", type=int, default=None, help="Năm (ví dụ: 2015).")
+
     args = ap.parse_args()
 
     # CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -1337,7 +1343,7 @@ if __name__ == "__main__":
 
     # Nếu đang dùng profile thật (USER_DATA_DIR), có thể bỏ bootstrap_auth.
     bootstrap_auth(d)
-
+    import sys
     try:
         install_early_hook(d, keep_last=KEEP_LAST)
     except Exception as e:
@@ -1361,6 +1367,36 @@ if __name__ == "__main__":
     cursor_ckpt   = state.get("cursor")                 # cursor đã lưu lần trước (last_good_cursor)
     vars_template = state.get("vars_template") or template_now
     effective_template = vars_template or template_now
+    if args.backfill and args.year and args.from_month and args.to_month:
+        print(f"[MODE] Backfill từ tháng {args.from_month}/{args.year} → {args.to_month}/{args.year}")
+        cur = args.from_month
+        while cur >= args.to_month:
+            start = datetime.datetime(args.year, cur, 1)
+            if cur == 1:
+                end = datetime.datetime(args.year - 1, 12, 1)
+            else:
+                end = datetime.datetime(args.year, cur - 1, 1)
+
+            t_from = int(end.timestamp())
+            t_to = int(start.timestamp())
+
+            print(f"\n🕰️ Crawling trước {start.strftime('%Y-%m-%d')} ...")
+            total_new, min_created, has_next = paginate_window(
+                d, form, effective_template, seen_ids=set(),
+                t_from=t_from,
+                t_to=t_to,
+                page_limit=args.page_limit
+            )
+            print(f"✅ Done {start.strftime('%Y-%m')} → {total_new} posts | min_created={min_created}")
+            save_checkpoint(cursor=None, seen_ids=list(seen_ids),
+                            vars_template=effective_template,
+                            mode="time", slice_from=None, slice_to=t_to, year=args.year)
+            time.sleep(2)
+            cur -= 1
+
+        print("\n🎉 [DONE] Backfill completed.")
+        d.quit()
+        sys.exit(0)
 
     # ✅ Resume đúng vị trí (nếu có --resume và có cursor trong checkpoint)
     if args.resume and cursor_ckpt:

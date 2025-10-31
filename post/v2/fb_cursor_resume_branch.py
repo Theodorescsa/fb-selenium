@@ -1279,7 +1279,6 @@ def choose_best_branch(d, branches, seen_ids_seed=None):
 # =========================
 # MAIN
 # =========================
-from get_posts_fb_automation import start_driver  # nếu không có, thay bằng start_driver_with_proxy(PROXY_URL)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

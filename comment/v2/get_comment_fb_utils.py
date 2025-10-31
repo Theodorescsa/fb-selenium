@@ -510,8 +510,8 @@ def load_checkpoint(path="checkpoint_comments.json"):
 
 def save_checkpoint(data: dict, path="checkpoint_comments.json"):
     tmp = path + ".tmp"
-    with open(tmp,"w",encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # with open(tmp,"w",encoding="utf-8") as f:
+    #     json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
     
 # =========================

@@ -388,23 +388,23 @@ def _pick_comment_text(n: dict) -> str | None:
 def _author_block(n: dict):
     """Return author basic info tuple."""
     a = n.get("author") or {}
-    return a.get("id"), a.get("name"), a.get("url") or a.get("profile_url")
+    return a.get("id"), a.get("name"), a.get("url"), a.get("profile_picture_depth_0")
 
 
-def _get_image_url_if_any(n: dict) -> str | None:
-    """Pick media image/thumb from attachments if available."""
-    for att in n.get("attachments", []) or []:
-        media = att.get("media") or {}
-        uri = (
-            (media.get("image") or {}).get("uri")
-            or (media.get("photo_image") or {}).get("uri")
+def _get_image_url_if_any(n: dict) -> list[str]:
+    urls = []
+    for att in (n.get("attachments") or []):
+        media = (
+            att.get("media")
+            or att.get("style_type_renderer", {}).get("attachment", {}).get("media")
+            or {}
         )
-        if isinstance(uri, str) and uri.startswith("http"):
-            return uri
-        thumb = (media.get("previewImage") or {}).get("uri")
-        if isinstance(thumb, str) and thumb.startswith("http"):
-            return thumb
-    return None
+        for key in ("image", "photo_image", "blurred_image", "previewImage"):
+            uri = (media.get(key) or {}).get("uri")
+            if isinstance(uri, str) and uri.startswith("http"):
+                urls.append(uri)
+    return list(dict.fromkeys(urls))  # unique giữ thứ tự
+
 
 
 def _reply_count(fb: dict, n: dict) -> int:
@@ -415,7 +415,174 @@ def _reply_count(fb: dict, n: dict) -> int:
     rc = (fb or {}).get("replies_connection") or (n.get("replies_connection") or {})
     edges = (rc or {}).get("edges") or []
     return len(edges) if isinstance(edges, list) else 0
+def _pick_source_id_from_node(node: dict) -> str | None:
+    # ưu tiên nguồn trực tiếp
+    sid = _first(
+        _get_in(node, ["owning_profile", "id"]),
+        _get_in(node, ["page", "id"]),
+        _get_in(node, ["group", "id"]),
+        _get_in(node, ["source", "id"]),
+    )
+    if sid:
+        return sid
 
+    # 👇 NEW: nhiều comment/reply lại nhét owning_profile trong parent_feedback
+    pf = node.get("parent_feedback") or {}
+    sid = _first(
+        _get_in(pf, ["owning_profile", "id"]),
+        _get_in(pf, ["page", "id"]),
+        _get_in(pf, ["group", "id"]),
+    )
+    if sid:
+        return sid
+
+    return None
+
+def _get_video_urls_if_any(n: dict) -> list[str]:
+    """
+    Trả về danh sách tất cả các video link tìm được trong 1 comment/post node.
+    Hỗ trợ:
+      - attachments[].media
+      - attachments[].style_type_renderer.attachment.media
+      - target.permalink_url
+      - node["video"]
+      - fallback từ video_id
+    """
+    out: list[str] = []
+
+    def _add(u: str | None):
+        if isinstance(u, str) and u.startswith("http"):
+            if u not in out:
+                out.append(u)
+
+    atts = (n.get("attachments") or [])
+    for att in atts:
+        # 1) kiểu thường: attachments[].media
+        media = att.get("media") or {}
+        for key in (
+            "playable_url",
+            "browser_native_hd_url",
+            "browser_native_sd_url",
+            "playable_url_quality_hd",
+            "playable_url_quality_sd",
+            "permalink_url",
+        ):
+            _add(media.get(key))
+
+        # 2) kiểu ông gửi: style_type_renderer.attachment.media / target
+        strr = att.get("style_type_renderer") or {}
+        attachment = (strr.get("attachment") or {})
+        media2 = attachment.get("media") or {}
+        target2 = attachment.get("target") or {}
+
+        for key in (
+            "playable_url",
+            "browser_native_hd_url",
+            "browser_native_sd_url",
+            "permalink_url",
+        ):
+            _add(media2.get(key))
+
+        _add(target2.get("permalink_url"))
+
+        # 3) nếu chỉ có id video → build link watch
+        vid_id = (
+            media2.get("id")
+            or media.get("id")
+            or target2.get("id")
+        )
+        if isinstance(vid_id, str):
+            _add(f"https://www.facebook.com/watch/?v={vid_id}")
+
+    # 4) fallback: node["video"]
+    video_field = n.get("video") or {}
+    for key in (
+        "playable_url",
+        "browser_native_hd_url",
+        "browser_native_sd_url",
+        "permalink_url",
+    ):
+        _add(video_field.get(key))
+
+    return out
+
+def _pick_source_id_from_payload(pay: dict) -> str | None:
+    """
+    Lấy source_id ở tầng root của response (thường là post/group/page).
+    """
+    root = _get_in(pay, ["data", "node"]) or {}
+    return _pick_source_id_from_node(root)
+def _build_comment_row_from_node(n: dict, fallback_source_id: str | None = None) -> dict:
+    fb = n.get("feedback") or {}
+
+    author_id = _get_in(n, ["author", "id"])
+    author_name = _get_in(n, ["author", "name"])
+    author_link = _pick_url(
+        _get_in(n, ["author", "url"]),
+        _get_in(n, ["author", "profile_url"]),
+    )
+    avatar = _get_in(n, ["author", "profile_picture_depth_0"])
+
+    content = (
+        _pick_comment_text(n)
+        or _get_in(n, ["body", "text"])
+        or _get_in(n, ["content"])
+    )
+
+    created_time = _get_comment_created_time(n)
+    image_urls = _get_image_url_if_any(n)
+    bd = _reaction_breakdown_from_top_edges(fb)
+    reply_cnt = _reply_count(fb, n)
+
+    # 👇 LẤY SOURCE ID CỦA BÀI (page / group / user)
+    source_id_here = _pick_source_id_from_node(n) or fallback_source_id
+
+    # 👇 LẤY VIDEO (có thể là list)
+    video_urls = _get_video_urls_if_any(n)
+
+    # 👇 LẤY FEEDBACK ID (cực quan trọng để đào reply)
+    feedback_id = (
+        fb.get("id")
+        or _get_in(n, ["parent_feedback", "id"])
+        or _get_in(n, ["feedback", "legacy_api_post_id"])  # phòng xa
+    )
+
+    raw_id = n.get("id") or n.get("legacy_fbid")
+    if source_id_here and raw_id:
+        row_id = f"{source_id_here}_{raw_id}"
+    else:
+        row_id = raw_id
+
+    row = {
+        "id": row_id,
+        "raw_comment_id": raw_id,           # optional: id FB gốc
+        "type": "Comment",
+        "link": _get_comment_permalink(n),
+        "author_id": author_id,
+        "author": author_name,
+        "author_link": author_link,
+        "avatar": avatar,
+        "created_time": created_time,
+        "content": content,
+        "image_url": image_urls,
+        "like": int(bd.get("like", 0)),
+        "haha": int(bd.get("haha", 0)),
+        "wow": int(bd.get("wow", 0)),
+        "sad": int(bd.get("sad", 0)),
+        "love": int(bd.get("love", 0)),
+        "angry": int(bd.get("angry", 0)),
+        "care": int(bd.get("care", 0)),
+        "comment": int(reply_cnt),
+        "share": 0,
+        "hashtag": _extract_hashtags_from_text(content),
+        "video": video_urls,
+        "source_id": source_id_here,
+        "feedback_id": feedback_id,         # 👈👈👈 THÊM CÁI NÀY
+        "is_share": False,
+        "link_share": None,
+        "type_share": "shared_none",
+    }
+    return row
 
 def _iter_comment_nodes(root):
     """
@@ -496,35 +663,36 @@ def extract_full_posts_from_resptext(resp_text: str):
 
             fb = n.get("feedback") or {}
 
-            author_id, author_name, author_link = _author_block(n)
-            row_new = {
-                "id": cid,
-                "type": "Comment",
-                "link": _get_comment_permalink(n),
-                "author_id": author_id,
-                "author": author_name,
-                "author_link": author_link,
-                "avatar": None,  # có thể thêm nếu payload có
-                "created_time": _get_comment_created_time(n),
-                "content": _pick_comment_text(n),
-                "image_url": _get_image_url_if_any(n),
-                # reactions breakdown
-                "like": 0,
-                "haha": 0,
-                "wow": 0,
-                "sad": 0,
-                "love": 0,
-                "angry": 0,
-                "care": 0,
-                "comment": _reply_count(fb, n),
-                "share": 0,
-                "hashtag": None,
-                "video": None,
-                "source_id": None,
-                "is_share": False,
-                "link_share": None,
-                "type_share": "shared_none",
-            }
+            author_id, author_name, author_link, _author_avatar = _author_block(n)
+            # row_new = {
+            #     "id": cid,
+            #     "type": "Comment",
+            #     "link": _get_comment_permalink(n),
+            #     "author_id": author_id,
+            #     "author": author_name,
+            #     "author_link": author_link,
+            #     "avatar": _author_avatar,  # có thể thêm nếu payload có
+            #     "created_time": _get_comment_created_time(n),
+            #     "content": _pick_comment_text(n),
+            #     "image_url": _get_image_url_if_any(n),
+            #     # reactions breakdown
+            #     "like": 0,
+            #     "haha": 0,
+            #     "wow": 0,
+            #     "sad": 0,
+            #     "love": 0,
+            #     "angry": 0,
+            #     "care": 0,
+            #     "comment": _reply_count(fb, n),
+            #     "share": 0,
+            #     "hashtag": None,
+            #     "video": None,
+            #     "source_id": None,
+            #     "is_share": False,
+            #     "link_share": None,
+            #     "type_share": "shared_none",
+            # }
+            row_new = _build_comment_row_from_node(n)
 
             # breakdown fill
             bd = _reaction_breakdown_from_top_edges(fb)
@@ -550,6 +718,8 @@ def extract_full_posts_from_resptext(resp_text: str):
                     "video",
                     "source_id",
                     "link_share",
+                    "feedback_id",      # 👈 thêm
+
                 ):
                     prev[k] = _nz(prev.get(k), row_new.get(k))
                 for k in ("like", "haha", "wow", "sad", "love", "angry", "care", "comment", "share"):
@@ -560,97 +730,92 @@ def extract_full_posts_from_resptext(resp_text: str):
 
     rows = list(by_id.values())
     return rows, end_cursor, total, obj
-def extract_replies_from_depth1_resp(resp_text, parent_comment_id):
+def extract_replies_from_depth1_resp(resp_text, parent_comment_id=None):
+    """
+    Parser siêu chịu đựng cho reply depth-1.
+    Giờ sẽ cố build luôn thành row giống comment cha (nếu payload đủ).
+    """
     try:
-        resp = json.loads(resp_text)
+        obj = json.loads(resp_text)
     except Exception:
         return [], None
 
-    data = resp.get("data", {})
-    node = data.get("node", {})  # đây là Feedback trong file ông
+    payloads = obj if isinstance(obj, list) else [obj]
+
     out = []
     next_token = None
 
-    # ===== CASE 1: kiểu cũ có comment_rendering_instance_for_feed_location =====
-    cri = node.get("comment_rendering_instance_for_feed_location")
-    if cri:
-        comments = (cri.get("comments") or {})
-        edges = comments.get("edges") or []
-        for edge in edges:
-            c = (edge.get("node") or {})
-            cid = c.get("id")
-            if cid != parent_comment_id:
-                continue
-
-            fb = c.get("feedback") or {}
-            exp_info = fb.get("expansion_info") or {}
-            next_token = exp_info.get("expansion_token") or exp_info.get("expansionToken")
-
-            replies_block = (
-                fb.get("comment_replies")
-                or fb.get("threaded_comments")
-                or {}
-            )
-            r_edges = replies_block.get("edges") or []
-            for r_edge in r_edges:
-                r = (r_edge.get("node") or {})
-                rid = r.get("id")
-                body = ""
-                if isinstance(r.get("body"), dict):
-                    body = r["body"].get("text") or ""
-                else:
-                    body = r.get("content") or ""
-                author = ((r.get("author") or {}).get("name")) or None
-                out.append({
-                    "id": rid,
-                    "content": body,
-                    "author": author,
-                })
-
-        return out, next_token
-
-    # ===== CASE 2: kiểu như file ông upload: node là Feedback =====
-    # data.node.replies_connection.edges[*].node chính là reply
-    if node.get("__typename") == "Feedback":
+    def _yield_edges_from_node(node: dict):
+        if not isinstance(node, dict):
+            return
+        # 1) replies_connection
         rc = (node.get("replies_connection") or {})
-        edges = rc.get("edges") or []
+        for e in rc.get("edges") or []:
+            yield e.get("node") or {}
+        # 2) display_comments
+        dc = (node.get("display_comments") or {})
+        for e in dc.get("edges") or []:
+            yield e.get("node") or {}
+        # 3) comment_replies
+        cr = (node.get("comment_replies") or {})
+        for e in cr.get("edges") or []:
+            yield e.get("node") or {}
+        # 4) threaded_comments
+        tc = (node.get("threaded_comments") or {})
+        for e in tc.get("edges") or []:
+            yield e.get("node") or {}
+        # 5) comments.edges
+        cm = (node.get("comments") or {})
+        for e in cm.get("edges") or []:
+            yield e.get("node") or {}
 
-        for edge in edges:
-            rnode = (edge.get("node") or {})
+    for resp in payloads:
+        data = resp.get("data") or {}
 
-            # check có đúng là reply của thằng mình đang đào không
-            parent_ent = (
-                rnode.get("comment_parent")
-                or rnode.get("comment_direct_parent")
-                or {}
-            )
-            # if parent_ent.get("id") != parent_comment_id:
-            #     # không phải reply của thằng mình cần → bỏ
-            #     continue
+        # 👇 Lấy source_id của bài từ root luôn (phòng khi reply không có)
+        fallback_source_id = _pick_source_id_from_payload(resp)
 
-            # lấy token tiếp cho lần sau (nó nằm trong feedback của từng reply)
-            fb = rnode.get("feedback") or {}
-            exp_info = fb.get("expansion_info") or {}
-            token_here = exp_info.get("expansion_token") or exp_info.get("expansionToken")
+        root = (
+            data.get("feedback")
+            or data.get("node")
+            or data.get("comment")
+            or {}
+        )
+
+        # Case kiểu cũ: data.node.comment_rendering_instance_for_feed_location...
+        cri = root.get("comment_rendering_instance_for_feed_location")
+        if cri:
+            comments = (cri.get("comments") or {})
+            for e in comments.get("edges") or []:
+                c = e.get("node") or {}
+                cid = c.get("id")
+                if parent_comment_id and cid != parent_comment_id:
+                    continue
+
+                fb = c.get("feedback") or {}
+                exp_info = fb.get("expansion_info") or {}
+                token_here = exp_info.get("expansion_token") or exp_info.get("expansionToken")
+                if token_here:
+                    next_token = token_here
+
+                # replies nằm trong feedback
+                for rnode in _yield_edges_from_node(fb):
+                    # build row giống comment cha
+                    row = _build_comment_row_from_node(rnode, fallback_source_id=fallback_source_id)
+                    out.append(row)
+
+            continue  # xong payload này
+
+        # Case mới: data.feedback.{replies_connection|...}
+        for rnode in _yield_edges_from_node(root):
+            fb2 = rnode.get("feedback") or {}
+            exp_info2 = fb2.get("expansion_info") or {}
+            token_here = exp_info2.get("expansion_token") or exp_info2.get("expansionToken")
             if token_here:
                 next_token = token_here
 
-            # lấy nội dung
-            body = ""
-            if isinstance(rnode.get("body"), dict):
-                body = rnode["body"].get("text") or ""
-            else:
-                body = (rnode.get("preferred_body") or {}).get("text") or ""
+            # build row giống comment
+            row = _build_comment_row_from_node(rnode, fallback_source_id=fallback_source_id)
+            out.append(row)
 
-            author = ((rnode.get("author") or {}).get("name")) or None
-
-            out.append({
-                "id": rnode.get("id"),
-                "content": body,
-                "author": author,
-            })
-
-        return out, next_token
-
-    # không rơi vào case nào
-    return [], None
+    return out, next_token

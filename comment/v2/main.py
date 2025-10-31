@@ -17,6 +17,7 @@ from get_comment_fb_automation import (
                                  click_view_more_if_any,
                                  graphql_post_in_page,
                                  parse_form,
+                                 pick_reply_template_from_page,
                                  scroll_to_last_comment,
                                  start_driver,
                                  install_early_hook,
@@ -41,10 +42,8 @@ def crawl_replies_for_parent_expansion(
     pages = 0
     current_token = parent_token
 
-    # clone form và sửa doc_id sang query reply
     reply_form = dict(form)
     reply_form["doc_id"] = REPLY_DOC_ID
-    # optional: cũng có thể sửa friendly name
     reply_form["fb_api_req_friendly_name"] = "Depth1CommentsListPaginationQuery"
 
     while True:
@@ -52,17 +51,15 @@ def crawl_replies_for_parent_expansion(
         if max_reply_pages and pages > max_reply_pages:
             break
 
-        # build vars
         use_vars = dict(base_reply_vars)
-
-        # dọn mấy field của comment-level đi, cho sạch
+        # dọn field comment-level
         use_vars.pop("commentsAfterCount", None)
         use_vars.pop("commentsAfterCursor", None)
         use_vars.pop("commentsBeforeCount", None)
         use_vars.pop("commentsBeforeCursor", None)
 
-        # đây mới là cái reply cần
-        use_vars["id"] = parent_id               # ⚠️ giờ là FEEDBACK ID
+        # query theo FEEDBACK ID
+        use_vars["id"] = parent_id
         use_vars["repliesAfterCount"] = 20
         if current_token:
             use_vars["expansionToken"] = current_token
@@ -75,19 +72,16 @@ def crawl_replies_for_parent_expansion(
         except Exception:
             resp_text = clean_fn(resp_text)
 
+        # 👇 Lúc này replies là list "full rows"
         replies, next_token = extract_fn(resp_text, parent_id)
 
         new_cnt = 0
         for r in replies:
-            txt = (r.get("content") or "").strip()
-            if not txt:
-                continue
+            # r đã là dạng comment-row rồi → chỉ thêm metadata để phân biệt reply
             rec = {
+                **r,
                 "is_reply": True,
                 "parent_id": parent_id,
-                "text": txt,
-                "reply_id": r.get("id"),
-                "author": r.get("author"),
                 "page": pages,
                 "ts": time.time(),
             }
@@ -101,6 +95,7 @@ def crawl_replies_for_parent_expansion(
             break
 
         current_token = next_token
+
 def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoint_comments.json", max_pages=None):
 
     # 1) ensure one lightweight scroll to produce first request
@@ -151,7 +146,7 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
             "friendly": friendly,
             "ts": time.time()
         }
-        save_checkpoint(ck, checkpoint_path)
+        # save_checkpoint(ck, checkpoint_path)
 
     # 3) paginate via replay
     all_texts = []
@@ -177,26 +172,29 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
 
         # parse “an toàn”
         try:
+            # case FB trả JSON sạch
             json_resp = json.loads(resp_text)
             cleaned = resp_text
             reply_token_map = {}
             collect_reply_tokens_from_json(json_resp, reply_token_map)
         except Exception as e:
+            # case FB trả 2 JSON dính nhau → dùng hàm clean
             cleaned = clean_fb_resp_text(resp_text)
             json_resp = json.loads(cleaned)
-            os.makedirs("raw_dumps", exist_ok=True)
-            with open(f"raw_dumps/page{pages}.txt", "w", encoding="utf-8") as f:
-                f.write(resp_text)
+
+            # os.makedirs("raw_dumps", exist_ok=True)
+            # with open(f"raw_dumps/page{pages}.txt", "w", encoding="utf-8") as f:
+            #     f.write(resp_text)
+
             print(f"[WARN] page {pages} parse fail:", e)
             # không continue vì đã parse ok qua cleaned
 
-        # lưu JSON sạch để trace (optional)
-        with open(f"raw_dumps/page{pages}.json", "w", encoding="utf-8") as f:
-            json.dump(json_resp, f, ensure_ascii=False, indent=2)
+        # # lưu JSON sạch để trace (optional)
+        # with open(f"raw_dumps/page{pages}.json", "w", encoding="utf-8") as f:
+        #     json.dump(json_resp, f, ensure_ascii=False, indent=2)
 
         # extract
         batch_texts, end_cursor, total_target, extra = extract_full_posts_from_resptext(cleaned)
-        reply_jobs = deque()
         if extra and isinstance(extra, dict):
             for job in extra.get("reply_jobs", []):
                 # job kiểu: {"id": parent_comment_id, "token": expansion_token}
@@ -229,45 +227,67 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
                         or item.get("body")
                         or json.dumps(item, ensure_ascii=False)
                     )
-                    # phát hiện replies
-                    parent_id = item.get("id")
-                    reply_count = item.get("comment") or item.get("reply_count") or 0
+                    reply_count = (
+                        item.get("comment")
+                        or item.get("reply_count")
+                        or item.get("comments_count")
+                        or 0
+                    )
                 else:
                     txt = str(item)
-                    parent_id, reply_count = None, 0
+                    reply_count = 0
 
                 txt = (txt or "").strip()
                 if not txt:
                     continue
-                # dedupe theo nội dung (tạm thời; nếu có id comment nên dedupe theo id)
+
+                # dedupe
                 h = hashlib.md5(txt.encode("utf-8")).hexdigest()
                 if h in seen_text_hash:
                     continue
                 seen_text_hash.add(h)
 
-                # ghi NDJSON top-level
-                append_ndjson_line(out_json, {
+                # ghi dòng comment
+                rec = {
+                    **item,
                     "is_reply": False,
                     "parent_id": None,
                     "page": pages,
                     "index_in_page": idx,
-                    "text": txt,
                     "cursor": end_cursor,
                     "ts": time.time(),
-                    "target": total_target
-                })
+                    "target": total_target,
+                }
+                append_ndjson_line(out_json, rec)
                 new_cnt += 1
 
-                # enqueue replies nếu có
-                if parent_id and isinstance(reply_count, int) and reply_count > 0:
-                    info = reply_token_map.get(parent_id)
+                # 🟣🟣🟣 ENQUEUE REPLIES Ở ĐÂY
+                # extractor mới đã có: item["feedback_id"], item["raw_comment_id"]
+                fb_id = item.get("feedback_id")
+                raw_cid = item.get("raw_comment_id") or item.get("id")
+
+                if isinstance(reply_count, int) and reply_count > 0:
+                    info = None
+
+                    # 1) ưu tiên feedback_id vì crawl replies đang query theo feedback
+                    if fb_id:
+                        info = reply_token_map.get(fb_id)
+
+                    # 2) thử theo id gốc
+                    if not info and raw_cid:
+                        info = reply_token_map.get(raw_cid)
+
+                    # 3) thử theo id hiện tại
+                    if not info and item.get("id"):
+                        info = reply_token_map.get(item["id"])
+
                     if info:
                         reply_jobs.append({
-                            "id": info["feedback_id"],   # <-- cái query reply cần
+                            "id": info["feedback_id"],   # để crawl_replies_for_parent_expansion dùng
                             "token": info["token"],
                         })
                     else:
-                        print(f"[REPLIES] comment {parent_id[:12]}… có {reply_count} replies nhưng KHÔNG thấy expansionToken/feedback_id → skip")
+                        print(f"[REPLIES] comment {(raw_cid or fb_id or '')[:12]}… có {reply_count} replies nhưng KHÔNG thấy expansionToken/feedback_id → skip")
 
             all_texts.extend(batch_texts)
             print(f"[V2] Page {pages}: +{new_cnt}/{len(batch_texts)} comments (cursor={bool(current_cursor)})")
@@ -277,7 +297,7 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
         ck["vars_template"] = vars_template
         ck["cursor_key"] = cursor_key
         ck["ts"] = time.time()
-        save_checkpoint(ck, checkpoint_path)
+        # save_checkpoint(ck, checkpoint_path)
 
         # ADVANCE cursor (chỉ 1 lần)
         current_cursor = end_cursor
