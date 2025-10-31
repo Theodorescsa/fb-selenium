@@ -14,7 +14,7 @@ from selenium.webdriver.chrome.options import Options
 # ----------------------------
 CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 USER_DATA_DIR = r"E:\NCS\Userdata"       # thư mục user data (chứa các Profile)
-PROFILE_NAME  = "Profile 5"              # ví dụ: "Profile 5", "Default"
+PROFILE_NAME  = "Profile 40"              # ví dụ: "Profile 5", "Default"
 REMOTE_PORT   = 9222                     # khác với port bạn dùng ở crawler để khỏi đụng nhau
 
 # Các origin sẽ vào để lấy storage
@@ -33,9 +33,9 @@ ALLOWED_COOKIE_DOMAINS = [
 ]
 
 # File output
-OUT_COOKIES_PATH       = r"authen\cookies.json"
-OUT_LOCALSTORAGE_PATH  = r"authen\localstorage.json"
-OUT_SESSIONSTORAGE_PATH= r"authen\sessionstorage.json"
+OUT_COOKIES_PATH       = r"E:\NCS\fb-selenium\post\v2\authen_theodorescsa0312\cookies.json"
+OUT_LOCALSTORAGE_PATH  = r"E:\NCS\fb-selenium\post\v2\authen_theodorescsa0312\localstorage.json"
+OUT_SESSIONSTORAGE_PATH= r"E:\NCS\fb-selenium\post\v2\authen_theodorescsa0312\sessionstorage.json"
 
 # ----------------------------
 # Utils

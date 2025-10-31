@@ -1,0 +1,92 @@
+[
+  {
+    "name": "datr",
+    "value": "8c0EaQLXAD5Xtj7tkSTe4U8k",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "None",
+    "expires": 1796482545.401057
+  },
+  {
+    "name": "sb",
+    "value": "8c0EaSSJ_ZTe1Fx8s8DbwQ2W",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "None",
+    "expires": 1796482555.205743
+  },
+  {
+    "name": "wd",
+    "value": "1536x730",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": false,
+    "sameSite": "Lax",
+    "expires": 1762527345
+  },
+  {
+    "name": "ps_l",
+    "value": "1",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "Lax",
+    "expires": 1796482545.646508
+  },
+  {
+    "name": "ps_n",
+    "value": "1",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "None",
+    "expires": 1796482545.646591
+  },
+  {
+    "name": "dpr",
+    "value": "1.25",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": false,
+    "sameSite": "None",
+    "expires": 1762527350
+  },
+  {
+    "name": "c_user",
+    "value": "61582988557869",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": false,
+    "sameSite": "None",
+    "expires": 1793458555.205594
+  },
+  {
+    "name": "xs",
+    "value": "20%3A6tEvNaaZQkP4lw%3A2%3A1761922552%3A-1%3A-1",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "None",
+    "expires": 1793458555.205787
+  },
+  {
+    "name": "fr",
+    "value": "0q3NdQBBUABdpkhCo.AWdbxW9BYCk--4RvOf2H9B6bU62gbXBOUhrfSnUp-jt5-cQI_xg.BpBM3x..AAA.0.0.BpBM37.AWcBm3DE4W0AYyItYEelnPVs4BY",
+    "domain": ".facebook.com",
+    "path": "/",
+    "secure": true,
+    "httpOnly": true,
+    "sameSite": "None",
+    "expires": 1769698555.611304
+  }
+]

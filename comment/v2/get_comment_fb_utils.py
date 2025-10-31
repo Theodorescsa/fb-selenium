@@ -282,7 +282,7 @@ def open_sort_menu_unified(driver, timeout=10):
     if not safe_click(driver, btn):
         raise ElementClickInterceptedException("Không click được nút Sort (global).")
     # small pause for menu mount/animation
-    time.sleep(0.25)
+    time.sleep(1)
     return True
 
 def choose_all_comments_unified(driver, timeout=10):
@@ -293,7 +293,7 @@ def choose_all_comments_unified(driver, timeout=10):
     opt = wait_first_xpath_anywhere(driver, xpaths, timeout=timeout)
     if not safe_click(driver, opt):
         raise ElementClickInterceptedException("Không click được option 'All comments' (global).")
-    time.sleep(0.25)
+    time.sleep(1)
     return True
 
 def set_sort_to_all_comments_unified(driver, max_retry=2):
@@ -538,35 +538,43 @@ def match_comment_req(rec: dict):
 
 def clean_fb_resp_text(resp_text: str) -> str:
     """
-    Làm sạch response GraphQL của Facebook, loại bỏ for (;;);
-    và nếu có nhiều JSON nối liền, chỉ lấy block hợp lệ nhất.
+    Làm sạch response GraphQL của Facebook.
+    - Bỏ prefix chống XSSI như 'for (;;);' hoặc ')]}\','.
+    - Nếu có nhiều JSON nối liền nhau, ưu tiên block chứa 'cursor'
+      (để giữ lại phần chứa end_cursor / expansion_token / pagination info).
+    - Nếu không có block chứa 'cursor', fallback chọn block hợp lệ dài nhất.
     """
     if not resp_text:
         return ""
 
     s = resp_text.strip()
 
-    # 1️⃣ Bỏ prefix chống XSSI
+    # 1️⃣ Bỏ prefix chống XSSI (một số payload bắt đầu bằng for (;;); hoặc )]}',)
     for prefix in ("for (;;);", ")]}',"):
-        if prefix in s:
-            s = s.replace(prefix, "")
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
 
-    # 2️⃣ Nếu response có nhiều JSON nối liền nhau (VD: }{ hoặc \n{)
-    # tách ra rồi chọn block JSON dài nhất (thường là phần chính)
-    parts = re.split(r'(?<=\})\s*(?=\{)', s)  # tách giữa 2 object dính nhau
+    # 2️⃣ Nếu response có nhiều JSON nối liền nhau → tách bằng regex
+    parts = re.split(r'(?<=\})\s*(?=\{)', s)
     if len(parts) > 1:
-        # thử parse từng block, chọn cái hợp lệ & dài nhất
         valid_blocks = []
         for p in parts:
+            p = p.strip()
             try:
-                json.loads(p)
-                valid_blocks.append(p.strip())
+                json.loads(p)  # thử parse xem hợp lệ không
+                valid_blocks.append(p)
             except json.JSONDecodeError:
                 continue
-        if valid_blocks:
-            s = max(valid_blocks, key=len)  # block dài nhất
 
-    # 3️⃣ Nếu bị HTML (login, redirect)
+        if valid_blocks:
+            # Ưu tiên block có 'cursor' (hoặc 'Cursor', 'expansion_token'…)
+            cursor_blocks = [p for p in valid_blocks if re.search(r'end_cursor|cursor|Cursor|expansion_token|expansionToken', p)]
+            if cursor_blocks:
+                s = max(cursor_blocks, key=len)
+            else:
+                s = max(valid_blocks, key=len)
+
+    # 3️⃣ Nếu response trả HTML (do login lỗi) thì raise để handle phía trên
     if s.lstrip().startswith("<!DOCTYPE html") or s.lstrip().startswith("<html"):
         raise ValueError("Got HTML instead of JSON (maybe login expired)")
 

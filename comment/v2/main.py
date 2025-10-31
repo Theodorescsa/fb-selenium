@@ -23,6 +23,7 @@ from get_comment_fb_automation import (
                                  install_early_hook,
                                  hook_graphql,
                                  wait_first_comment_request)
+from startdriverproxy import bootstrap_auth, start_driver_with_proxy
 os.makedirs("raw_dumps", exist_ok=True)
 
 REPLY_DOC_ID = "25396268633304296"  # từ payload của ông
@@ -171,9 +172,13 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
         resp_text = raw_ret.get("text") if isinstance(raw_ret, dict) else raw_ret
 
         # parse “an toàn”
+        reply_token_map = {}
         try:
             # case FB trả JSON sạch
+            with open(f"raw_dumps/page{pages}.txt", "w", encoding="utf-8") as f:
+                f.write(resp_text)
             json_resp = json.loads(resp_text)
+            
             cleaned = resp_text
             reply_token_map = {}
             collect_reply_tokens_from_json(json_resp, reply_token_map)
@@ -190,8 +195,8 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
             # không continue vì đã parse ok qua cleaned
 
         # # lưu JSON sạch để trace (optional)
-        # with open(f"raw_dumps/page{pages}.json", "w", encoding="utf-8") as f:
-        #     json.dump(json_resp, f, ensure_ascii=False, indent=2)
+        with open(f"raw_dumps/page{pages}.json", "w", encoding="utf-8") as f:
+            json.dump(json_resp, f, ensure_ascii=False, indent=2)
 
         # extract
         batch_texts, end_cursor, total_target, extra = extract_full_posts_from_resptext(cleaned)
@@ -347,8 +352,20 @@ def scroll_element_by_xpath(driver, xpath, fraction=0.8):
     ret = driver.execute_script(js, xpath, float(fraction))
     return bool(ret and ret.get("ok"))
 if __name__ == "__main__":
-    d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT)
-    install_early_hook(d)
+    # d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT, headless=False)
+    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    d.set_script_timeout(40)
+    try:
+        d.execute_cdp_cmd("Network.enable", {})
+        d.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+    except Exception:
+        pass
+
+    bootstrap_auth(d)
+    # try:
+    #     install_early_hook(d)
+    # except Exception as e:
+    #     print("[WARN] install_early_hook:", e)
 
     d.get(POST_URL)
     time.sleep(2)
