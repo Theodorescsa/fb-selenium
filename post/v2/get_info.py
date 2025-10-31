@@ -1,7 +1,9 @@
 # === replace / thêm các helper sau ===
-import pandas as pd
-from pathlib import Path
+from typing import Optional
 import re
+from urllib.parse import urlparse, parse_qs
+
+from configs import *
 REACTION_KEYS = {
     "LIKE": "like", "LOVE": "love", "HAHA": "haha", "WOW": "wow",
     "SAD": "sad", "ANGRY": "angry", "CARE": "care"
@@ -66,7 +68,7 @@ def extract_media(n):
     """Trả về (image_urls[], video_urls[])"""
     image_urls, video_urls = [], []
 
-    # image candidates
+    # 1) Ảnh – giữ nguyên logic cũ
     for k, v in _deep_iter(n):
         if k in ("image", "previewImage", "photo_image", "preferred_thumbnail"):
             if isinstance(v, dict):
@@ -75,14 +77,37 @@ def extract_media(n):
                     if uri not in image_urls:
                         image_urls.append(uri)
 
-    # video candidates
+    # 2) Video kiểu cũ (post thường)
     for k, v in _deep_iter(n):
-        if k in ("playable_url_quality_hd", "playable_url", "browser_native_hd_url", "browser_native_sd_url"):
+        if k in ("playable_url_quality_hd", "playable_url",
+                 "browser_native_hd_url", "browser_native_sd_url"):
             if isinstance(v, str) and v.startswith("http"):
                 if v not in video_urls:
                     video_urls.append(v)
 
+    # 3) Video kiểu REEL / kiểu mới (như JSON ông dán)
+    # tìm block videoDeliveryResponseFragment
+    for k, v in _deep_iter(n):
+        if k == "videoDeliveryResponseFragment" and isinstance(v, dict):
+            res = v.get("videoDeliveryResponseResult") or {}
+            # 3.1 progressive_urls -> đây chính là link mp4 ông muốn
+            prog_list = res.get("progressive_urls") or []
+            for item in prog_list:
+                url = item.get("progressive_url")
+                if isinstance(url, str) and url.startswith("http"):
+                    if url not in video_urls:
+                        video_urls.append(url)
+
+            # 3.2 nếu muốn lưu luôn dash_manifest_urls thì lấy ở đây
+            # dash_list = res.get("dash_manifest_urls") or []
+            # for item in dash_list:
+            #     murl = item.get("manifest_url")
+            #     if isinstance(murl, str) and murl.startswith("http"):
+            #         if murl not in video_urls:
+            #             video_urls.append(murl)
+
     return image_urls, video_urls
+
 
 
 # --- [1] BỔ SUNG: map id → reaction key (hay gặp trên Comet UFI)
@@ -414,3 +439,117 @@ def extract_share_flags_smart(n: dict, actor_text: str = None):
         if origin_id: break
 
     return is_share, link_share, type_share, origin_id, share_meta
+# =========================
+# Post collectors (ưu tiên rid + link + created_time)
+# =========================
+def _is_story_node(n: dict) -> bool:
+    if n.get("__typename") == "Story": return True
+    if n.get("__isFeedUnit") == "Story": return True
+    if "post_id" in n or "comet_sections" in n: return True
+    return False
+
+def _looks_like_group_post(n: dict) -> bool:
+    if not _is_story_node(n): return False
+    url = n.get("wwwURL") or n.get("url") or ""
+    pid = n.get("id") or ""
+    if POST_URL_RE.match(url): return True
+    if (isinstance(pid, str) and pid.startswith("Uzpf")) or n.get("post_id"): return True
+    return False
+
+def _extract_url_digits(url: str) -> Optional[str]:
+    if not url: return None
+    try:
+        path = urlparse(url).path.lower()
+    except:
+        path = url.lower()
+    m = re.search(r"/(?:reel|posts|permalink)/(\d+)", path)
+    if m: return m.group(1)
+    qs = parse_qs(urlparse(url).query)
+    for k in ("fbid","story_fbid","video_id","photo_id","id","v"):
+        v = qs.get(k)
+        if v and v[0] and v[0].isdigit():
+            return v[0]
+    return None
+
+def _dig_text(o):
+    texts = []
+    def take(x):
+        if isinstance(x, str):
+            t = x.strip()
+            if t and t.lower() not in {"see more", "xem thêm"}:
+                texts.append(t)
+    def dive(v):
+        if isinstance(v, dict):
+            if "text" in v and isinstance(v["text"], str): take(v["text"])
+            if "message" in v and isinstance(v["message"], dict):
+                if isinstance(v["message"].get("text"), str): take(v["message"]["text"])
+            if "body" in v and isinstance(v["body"], dict):
+                if isinstance(v["body"].get("text"), str): take(v["body"]["text"])
+            if "savable_description" in v and isinstance(v["savable_description"], dict):
+                if isinstance(v["savable_description"].get("text"), str): take(v["savable_description"]["text"])
+            for k in ("title", "subtitle", "headline", "label", "contextual_message"):
+                val = v.get(k)
+                if isinstance(val, dict) and isinstance(val.get("text"), str): take(val["text"])
+                elif isinstance(val, str): take(val)
+            for vv in v.values(): dive(vv)
+        elif isinstance(v, list):
+            for it in v: dive(it)
+    dive(o)
+    uniq, seen = [], set()
+    for t in texts:
+        if t not in seen:
+            uniq.append(t); seen.add(t)
+    return uniq
+
+def _extract_share_texts(n: dict):
+    actor_texts, attached_texts = [], []
+    if isinstance(n.get("message"), dict) and isinstance(n["message"].get("text"), str):
+        actor_texts.append(n["message"]["text"])
+    cs = n.get("comet_sections") or {}
+    if isinstance(cs, dict):
+        msg = cs.get("message")
+        if isinstance(msg, dict):
+            t = msg.get("text")
+            if isinstance(t, str) and t.strip():
+                actor_texts.append(t)
+        attached = cs.get("attached_story") or cs.get("content") or {}
+        if isinstance(attached, dict):
+            story = attached.get("story") if isinstance(attached.get("story"), dict) else attached
+            if isinstance(story, dict):
+                if isinstance(story.get("message"), dict) and isinstance(story["message"].get("text"), str):
+                    attached_texts.append(story["message"]["text"])
+                attached_texts.extend(_dig_text(story))
+    if not actor_texts:
+        actor_texts.extend(_dig_text(n))
+    def _uniq_keep(seq):
+        out, seen = [], set()
+        for s in seq:
+            s2 = s.strip()
+            if s2 and s2 not in seen:
+                out.append(s2); seen.add(s2)
+        return out
+    actor_texts = _uniq_keep(actor_texts)
+    attached_texts = _uniq_keep(attached_texts)
+    if actor_texts and attached_texts:
+        combined = actor_texts[0]
+        if combined not in attached_texts:
+            combined = combined + "\n\n" + attached_texts[0]
+    elif actor_texts:
+        combined = actor_texts[0]
+    elif attached_texts:
+        combined = attached_texts[0]
+    else:
+        combined = None
+    return (actor_texts[0] if actor_texts else None,
+            attached_texts[0] if attached_texts else None,
+            combined)
+    
+def filter_only_feed_posts(items):
+    keep = []
+    for it in items or []:
+        link = (it.get("link") or "").strip()
+        fb_id = (it.get("id") or "").strip()
+        rid = (it.get("rid") or "").strip()
+        if rid or (link and POST_URL_RE.match(link)) or (fb_id and fb_id.startswith("Uzpf")):
+            keep.append(it)
+    return keep
