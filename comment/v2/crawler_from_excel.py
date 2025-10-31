@@ -24,6 +24,8 @@ PROXY_URL = ""
 INPUT_EXCEL = r"E:\NCS\fb-selenium\thoibao-de-last.xlsx"          # file excel nguồn (có cột link)
 OUTPUT_EXCEL = r"E:\NCS\fb-selenium\thoibaode-comments.xlsx"      # file excel đích
 ERROR_EXCEL = r"E:\NCS\fb-selenium\crawl_errors.xlsx"             # file ghi những post crawl fail
+CHECKPOINT_PATH = r"E:\NCS\fb-selenium\crawl_checkpoint.json"     # base checkpoint
+SHEET_NAME = "Sheet1"  # 👈 👈 👈 THÊM Ở ĐÂY: chỉ định sheet muốn crawl
 MAX_RETRIES = 2                                                   # retry tối đa
 
 # cột mong muốn cho file output
@@ -80,26 +82,11 @@ def start_driver_with_proxy(proxy_url: str, headless: bool = False) -> webdriver
                 "https": proxy_url,
                 "no_proxy": "localhost,127.0.0.1",
             },
-            # "verify_ssl": False,
         }
 
     driver = webdriver.Chrome(options=chrome_opts, seleniumwire_options=sw_options)
     driver.scopes = [r".*"]
     return driver
-
-
-def _to_cell(v):
-    # None thì để rỗng
-    if v is None:
-        return ""
-    # nếu là dict kiểu {"uri": "..."} thì lấy uri
-    if isinstance(v, dict):
-        return v.get("uri") or v.get("url") or json.dumps(v, ensure_ascii=False)
-    # nếu là list thì join
-    if isinstance(v, list):
-        return ",".join(str(x) for x in v)
-    # còn lại convert sang str
-    return v
 
 
 def ensure_excel_with_header(path: str, columns: list[str]):
@@ -141,6 +128,46 @@ def append_error(path: str, link: str, error: str):
     wb.save(path)
 
 
+def make_checkpoint_path_for_sheet(base_path: str, sheet_name: str) -> str:
+    """
+    Tạo checkpoint riêng cho từng sheet.
+    vd: crawl_checkpoint.json  -> crawl_checkpoint_Sheet1.json
+    """
+    base_dir = os.path.dirname(base_path)
+    base_name = os.path.basename(base_path)
+    name, ext = os.path.splitext(base_name)
+    safe_sheet = sheet_name.replace(" ", "_")
+    final_name = f"{name}_{safe_sheet}{ext}"
+    return os.path.join(base_dir, final_name)
+
+
+def load_checkpoint(path: str) -> int:
+    """
+    Trả về index bắt đầu crawl.
+    - Nếu chưa có file → trả 0 (crawl từ đầu).
+    - Nếu có → đọc "last_index" và +1 để crawl post tiếp theo.
+    """
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        last_idx = int(data.get("last_index", -1))
+        return last_idx + 1 if last_idx >= 0 else 0
+    except Exception:
+        return 0
+
+
+def save_checkpoint(path: str, idx: int, total: int):
+    data = {
+        "last_index": idx,
+        "total": total,
+        "ts": time.time(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 def prepare_fb_page(driver, url: str):
     """Mở post và chuẩn bị để replay GraphQL."""
     driver.get(url)
@@ -154,23 +181,17 @@ def prepare_fb_page(driver, url: str):
 
 
 def crawl_one_post(driver, url: str, max_pages=None):
-    """
-    Crawl comment cho 1 post DUY NHẤT, trả về list[dict] đã chuẩn schema.
-    NOTE: phải xoá file tạm trước khi crawl post mới để tránh đọc dính post trước.
-    """
     out_json = "comments_tmp.ndjson"
     ckpt = "checkpoint_tmp.json"
 
-    # 💥 xoá file của lần crawl trước
+    # xoá file cũ
     if os.path.exists(out_json):
         os.remove(out_json)
     if os.path.exists(ckpt):
         os.remove(ckpt)
 
-    # ép FB tạo UFI
     prepare_fb_page(driver, url)
 
-    # gọi crawler gốc (của ông) – nó sẽ ghi vào out_json
     _ = crawl_comments(
         driver,
         out_json=out_json,
@@ -191,23 +212,11 @@ def crawl_one_post(driver, url: str, max_pages=None):
                 except Exception:
                     pass
 
-    # 🧹 optional: dọn sau khi đọc xong để folder đỡ đầy
-    # os.remove(out_json)
-    # if os.path.exists(ckpt):
-    #     os.remove(ckpt)
-
     return comments
 
 
 def normalize_comment_row(c: dict, postlink: str) -> dict:
-    """
-    Convert 1 comment dict của ông → đúng format output.
-    Hỗ trợ luôn cả dòng reply (is_reply=True).
-    """
-    # Nếu là reply thì mình đặt type = "Reply" cho dễ nhìn
     _type = c.get("type") or ("Reply" if c.get("is_reply") else "Comment")
-
-    # link comment: top-level có sẵn, reply thì thường không có
     comment_link = c.get("link")
 
     return {
@@ -240,23 +249,37 @@ def normalize_comment_row(c: dict, postlink: str) -> dict:
 
 def crawl_from_excel_stream(
     input_path: str,
+    sheet_name: str,
     output_path: str,
     error_path: str,
+    checkpoint_path: str,
     driver,
     max_retries: int = 2,
 ):
-    # chuẩn bị file output + file error trước
     ensure_excel_with_header(output_path, OUTPUT_COLUMNS)
     ensure_error_excel(error_path)
 
-    df = pd.read_excel(input_path)
+    # 👇 đọc đúng sheet
+    df = pd.read_excel(input_path, sheet_name=sheet_name)
+    total = len(df)
 
-    for idx, row in df.iterrows():
+    # 👇 tạo checkpoint riêng cho sheet này
+    sheet_checkpoint = make_checkpoint_path_for_sheet(checkpoint_path, sheet_name)
+    start_idx = load_checkpoint(sheet_checkpoint)
+
+    if start_idx > 0:
+        print(f"🔁 Resume từ dòng {start_idx} / {total} (sheet={sheet_name})")
+    else:
+        print(f"🆕 Chạy mới từ đầu (sheet={sheet_name})")
+
+    for idx in range(start_idx, total):
+        row = df.iloc[idx]
         postlink = str(row.get("link") or "").strip()
         if not postlink:
+            save_checkpoint(sheet_checkpoint, idx, total)
             continue
 
-        print(f"=== [{idx+1}/{len(df)}] Crawl: {postlink}")
+        print(f"=== [{idx+1}/{total}] ({sheet_name}) Crawl: {postlink}")
 
         success = False
         last_error = None
@@ -266,7 +289,6 @@ def crawl_from_excel_stream(
                 comments = crawl_one_post(driver, postlink, max_pages=None)
                 for c in comments:
                     norm = normalize_comment_row(c, postlink)
-                    # 👇 GHI LUÔN TỪNG DÒNG
                     append_row_to_excel(output_path, OUTPUT_COLUMNS, norm)
                 success = True
                 break
@@ -275,11 +297,14 @@ def crawl_from_excel_stream(
                 print(f"[WARN] crawl fail {postlink} (attempt {attempt+1}/{max_retries+1}): {e}")
                 time.sleep(1)
 
+        # ✅ Dù ok hay fail vẫn lưu checkpoint
         if not success:
             append_error(error_path, postlink, last_error or "unknown error")
             print(f"[SKIP] bỏ qua bài: {postlink}")
 
-    print("✅ DONE stream → xem file:", output_path)
+        save_checkpoint(sheet_checkpoint, idx, total)
+
+    print(f"✅ DONE sheet {sheet_name} → xem file: {output_path}")
 
 
 if __name__ == "__main__":
@@ -291,16 +316,16 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # Nếu đang dùng profile thật (USER_DATA_DIR), có thể bỏ bootstrap_auth.
     bootstrap_auth(d)
     install_early_hook(d)
 
     crawl_from_excel_stream(
         INPUT_EXCEL,
+        SHEET_NAME,          # 👈 truyền sheet muốn crawl
         OUTPUT_EXCEL,
         ERROR_EXCEL,
+        CHECKPOINT_PATH,
         driver=d,
         max_retries=MAX_RETRIES,
     )
-
-    # d.quit()  # nếu crawl xong muốn đóng luôn
+    # d.quit()

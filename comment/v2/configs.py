@@ -1,6 +1,6 @@
 CHROME_PATH   = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-USER_DATA_DIR = r"E:\NCS\Userdata"
-PROFILE_NAME  = "Profile 5"
+USER_DATA_DIR = r"C:\Users\MSI\AppData\Local\Google\Chrome\User Data"
+PROFILE_NAME  = "Profile 72"
 # POST_URL      = "https://web.facebook.com/thoibao.de/posts/pfbid027UnunXwk9fufTGKhEv9McrcGhqGrGcH8hEwCtDa8R1LsMygux4FqMBdddGzssRrBl"
 # POST_URL      = "https://web.facebook.com/watch/?v=762162930153013"
 POST_URL      = "https://www.facebook.com/reel/785418827653033/"

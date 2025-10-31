@@ -662,36 +662,6 @@ def extract_full_posts_from_resptext(resp_text: str):
                 continue
 
             fb = n.get("feedback") or {}
-
-            author_id, author_name, author_link, _author_avatar = _author_block(n)
-            # row_new = {
-            #     "id": cid,
-            #     "type": "Comment",
-            #     "link": _get_comment_permalink(n),
-            #     "author_id": author_id,
-            #     "author": author_name,
-            #     "author_link": author_link,
-            #     "avatar": _author_avatar,  # có thể thêm nếu payload có
-            #     "created_time": _get_comment_created_time(n),
-            #     "content": _pick_comment_text(n),
-            #     "image_url": _get_image_url_if_any(n),
-            #     # reactions breakdown
-            #     "like": 0,
-            #     "haha": 0,
-            #     "wow": 0,
-            #     "sad": 0,
-            #     "love": 0,
-            #     "angry": 0,
-            #     "care": 0,
-            #     "comment": _reply_count(fb, n),
-            #     "share": 0,
-            #     "hashtag": None,
-            #     "video": None,
-            #     "source_id": None,
-            #     "is_share": False,
-            #     "link_share": None,
-            #     "type_share": "shared_none",
-            # }
             row_new = _build_comment_row_from_node(n)
 
             # breakdown fill

@@ -1,0 +1,13 @@
+version: "3.9"
+services:
+  fb-crawler:
+    image: fb-crawler:latest
+    build: .
+    volumes:
+      - ./data_in:/app/data_in      # chỗ để Excel
+      - ./data_out:/app/data_out    # chỗ để NDJSON/Excel kết quả
+      - ./profiles:/app/profiles    # nếu cần lưu cookie/profile
+    environment:
+      - PROXY_URL=
+    deploy:
+      replicas: 3

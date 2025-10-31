@@ -1,1 +1,5 @@
 venv
+post/v2/database
+post/v2/authen
+post/v2/__pycache__
+comment/v2/__pycache__
