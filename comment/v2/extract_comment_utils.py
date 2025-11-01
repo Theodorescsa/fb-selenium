@@ -437,74 +437,77 @@ def _pick_source_id_from_node(node: dict) -> str | None:
         return sid
 
     return None
+def _collect_progressive_urls(obj) -> list[str]:
+    out: list[str] = []
 
+    def _add(u):
+        if isinstance(u, str) and u.startswith("http") and u not in out:
+            out.append(u)
+
+    if isinstance(obj, dict):
+        # Nhánh “chính thống” của FB
+        vdrf = obj.get("videoDeliveryResponseFragment") or {}
+        vdr = vdrf.get("videoDeliveryResponseResult") or {}
+
+        # 1) progressive_urls chuẩn
+        for it in vdr.get("progressive_urls", []) or []:
+            _add(it.get("progressive_url"))
+
+        # 2) phòng khi FB đổi key/đặt sâu hơn – quét đệ quy
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                for u in _collect_progressive_urls(v):
+                    _add(u)
+
+    elif isinstance(obj, list):
+        for x in obj:
+            for u in _collect_progressive_urls(x):
+                if u not in out:
+                    out.append(u)
+
+    return out
 def _get_video_urls_if_any(n: dict) -> list[str]:
-    """
-    Trả về danh sách tất cả các video link tìm được trong 1 comment/post node.
-    Hỗ trợ:
-      - attachments[].media
-      - attachments[].style_type_renderer.attachment.media
-      - target.permalink_url
-      - node["video"]
-      - fallback từ video_id
-    """
     out: list[str] = []
 
     def _add(u: str | None):
-        if isinstance(u, str) and u.startswith("http"):
-            if u not in out:
-                out.append(u)
+        if isinstance(u, str) and u.startswith("http") and u not in out:
+            out.append(u)
 
-    atts = (n.get("attachments") or [])
+    # a) attachments thường
+    atts = n.get("attachments") or []
     for att in atts:
-        # 1) kiểu thường: attachments[].media
-        media = att.get("media") or {}
-        for key in (
-            "playable_url",
-            "browser_native_hd_url",
-            "browser_native_sd_url",
-            "playable_url_quality_hd",
-            "playable_url_quality_sd",
-            "permalink_url",
-        ):
-            _add(media.get(key))
-
-        # 2) kiểu ông gửi: style_type_renderer.attachment.media / target
+        media = (att.get("media") or {})
         strr = att.get("style_type_renderer") or {}
-        attachment = (strr.get("attachment") or {})
+        attachment = strr.get("attachment") or {}
         media2 = attachment.get("media") or {}
         target2 = attachment.get("target") or {}
 
-        for key in (
-            "playable_url",
-            "browser_native_hd_url",
-            "browser_native_sd_url",
-            "permalink_url",
-        ):
-            _add(media2.get(key))
+        for src in (media, media2):
+            for key in ("playable_url", "browser_native_hd_url", "browser_native_sd_url", "permalink_url"):
+                _add(src.get(key))
+
+            # 👉 hút progressive_urls nếu có trong media
+            for u in _collect_progressive_urls(src):
+                _add(u)
 
         _add(target2.get("permalink_url"))
 
-        # 3) nếu chỉ có id video → build link watch
-        vid_id = (
-            media2.get("id")
-            or media.get("id")
-            or target2.get("id")
-        )
+        # fallback từ video_id
+        vid_id = media2.get("id") or media.get("id") or target2.get("id")
         if isinstance(vid_id, str):
             _add(f"https://www.facebook.com/watch/?v={vid_id}")
 
-    # 4) fallback: node["video"]
+    # b) field "video" trên node (nếu có)
     video_field = n.get("video") or {}
-    for key in (
-        "playable_url",
-        "browser_native_hd_url",
-        "browser_native_sd_url",
-        "permalink_url",
-    ):
+    for key in ("playable_url", "browser_native_hd_url", "browser_native_sd_url", "permalink_url"):
         _add(video_field.get(key))
 
+    # 👉 hút progressive_urls trong node["video"]
+    for u in _collect_progressive_urls(video_field):
+        _add(u)
+
     return out
+
 
 def _pick_source_id_from_payload(pay: dict) -> str | None:
     """

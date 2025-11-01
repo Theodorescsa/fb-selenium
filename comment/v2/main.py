@@ -3,6 +3,8 @@ import json, time, urllib.parse, os, hashlib
 from extract_comment_utils import extract_full_posts_from_resptext, extract_replies_from_depth1_resp
 from configs import *
 from get_comment_fb_utils import (
+                                 _split_top_level_json_objects,
+                                 _strip_xssi_globally,
                                  append_ndjson_line,
                                  clean_fb_resp_text,
                                  collect_reply_tokens_from_json,
@@ -101,12 +103,13 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
 
     # 1) ensure one lightweight scroll to produce first request
     baseline = driver.execute_script("return (window.__gqlReqs||[]).length")
+    set_sort_to_all_comments_unified(driver)
     # 1) click “Xem thêm …” nếu có, else kéo đến comment cuối
-    for _ in range(2):
+    for _ in range(1):
         if click_view_more_if_any(driver, max_clicks=1) == 0:  # FIX: dùng driver
             if not scroll_to_last_comment(driver):             # FIX: dùng driver
                 driver.execute_script("window.scrollBy(0, Math.floor(window.innerHeight*0.8));")
-        time.sleep(2)
+        time.sleep(1)
 
     first_req = wait_first_comment_request(driver, baseline, timeout=12, poll=0.2)
 
@@ -153,15 +156,17 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
     all_texts = []
     pages = 0
     current_cursor = ck.get("cursor")
-    seen_text_hash = set()
     seen_cursors = set()
     reply_jobs = deque()  # NEW: hàng đợi crawl replies
 
+    skip_count = 0
+    seen_links = set()
     while True:
         pages += 1
         if max_pages and pages > max_pages:
             break
-
+        if skip_count > 1:
+            break
         use_vars = dict(vars_template)
         use_vars.setdefault("commentsAfterCount", 50)
         if current_cursor:
@@ -184,8 +189,16 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
             collect_reply_tokens_from_json(json_resp, reply_token_map)
         except Exception as e:
             # case FB trả 2 JSON dính nhau → dùng hàm clean
-            cleaned = clean_fb_resp_text(resp_text)
-            json_resp = json.loads(cleaned)
+            raw = resp_text
+            stripped = _strip_xssi_globally(raw)
+            parts = _split_top_level_json_objects(stripped)
+            if len(parts) > 1:
+                cleaned = clean_fb_resp_text(raw)      # ưu tiên block có cursor bằng score đệ quy
+                json_resp = json.loads(cleaned)
+            else:
+                json_resp = json.loads(stripped)
+                cleaned = stripped
+
 
             # os.makedirs("raw_dumps", exist_ok=True)
             # with open(f"raw_dumps/page{pages}.txt", "w", encoding="utf-8") as f:
@@ -247,10 +260,15 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
                     continue
 
                 # dedupe
-                h = hashlib.md5(txt.encode("utf-8")).hexdigest()
-                if h in seen_text_hash:
-                    continue
-                seen_text_hash.add(h)
+                link = item.get("link").strip().lower()
+
+                # Nếu đã có thì bỏ qua
+                if link in seen_links:
+                    print(f"[SKIP] trùng comment {link or '(no link)'} -> skip")
+                    skip_count += 1
+
+                # Nếu chưa có thì thêm vào set
+                seen_links.add(link)
 
                 # ghi dòng comment
                 rec = {
@@ -265,7 +283,8 @@ def crawl_comments(driver, out_json="comments.ndjson", checkpoint_path="checkpoi
                 }
                 append_ndjson_line(out_json, rec)
                 new_cnt += 1
-
+                if skip_count > 1:
+                    break
                 # 🟣🟣🟣 ENQUEUE REPLIES Ở ĐÂY
                 # extractor mới đã có: item["feedback_id"], item["raw_comment_id"]
                 fb_id = item.get("feedback_id")
@@ -352,8 +371,8 @@ def scroll_element_by_xpath(driver, xpath, fraction=0.8):
     ret = driver.execute_script(js, xpath, float(fraction))
     return bool(ret and ret.get("ok"))
 if __name__ == "__main__":
-    # d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT, headless=False)
-    d = start_driver_with_proxy(PROXY_URL, headless=False)
+    d = start_driver(CHROME_PATH, USER_DATA_DIR, PROFILE_NAME, port=REMOTE_PORT, headless=False)
+    # d = start_driver_with_proxy(PROXY_URL, headless=False)
     d.set_script_timeout(40)
     try:
         d.execute_cdp_cmd("Network.enable", {})
@@ -361,7 +380,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    bootstrap_auth(d)
+    # bootstrap_auth(d)
     # try:
     #     install_early_hook(d)
     # except Exception as e:
@@ -373,7 +392,7 @@ if __name__ == "__main__":
     time.sleep(0.5)
     if "reel" in POST_URL:
         open_reel_comments_if_present(d)
-    set_sort_to_all_comments_unified(d)
+    # set_sort_to_all_comments_unified(d)
 
     # ép FB tạo UFI nếu chưa có
     time.sleep(0.8)

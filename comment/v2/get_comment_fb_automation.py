@@ -50,7 +50,7 @@ def start_driver(chrome_path,
                  user_data_dir,
                  profile_name,
                  port=9222,
-                 headless: bool = True,
+                 headless: bool = False,
                  timeout: float = 15.0):
     """
     Start a real Chrome process and attach Selenium via remote debugging.
@@ -364,22 +364,61 @@ def scroll_to_last_comment(driver):
     """
     return bool(driver.execute_script(js))
 
-def wait_first_comment_request(driver, start_idx, timeout=10, poll=0.2):
-    end = time.time() + timeout
-    i = start_idx
-    print("Waiting for first comment request after index", start_idx)
-    
-    # while time.time() < end:
-    print("time.time() < end",time.time() < end)
-    n = driver.execute_script("return (window.__gqlReqs||[]).length")
-    print("n",n)
-    while i <= n:
-        rec = driver.execute_script("return (window.__gqlReqs||[])[arguments[0]]", i)
-        i += 1
-        if rec and match_comment_req(rec):
-            return rec
-    time.sleep(poll)
-    # return None
+COMMENT_FRIENDLY_HINTS = (
+    "UFI", "Comment", "Comments", "CommentList", "CommentPagination",
+    "CometUFI", "CometComment"
+)
+
+def _is_comments_gql(req: dict) -> bool:
+    if not req:
+        return False
+    body = req.get("body") or ""
+    try:
+        form = parse_form(body)
+    except Exception:
+        return False
+
+    friendly = (form.get("fb_api_req_friendly_name") or "").lower()
+    if any(h.lower() in friendly for h in COMMENT_FRIENDLY_HINTS):
+        return True
+
+    # Dựa vào variables thay vì friendly_name (chắc cú hơn)
+    vars_str = urllib.parse.unquote_plus(form.get("variables","") or "")
+    try:
+        vars_obj = json.loads(vars_str) if vars_str else {}
+    except Exception:
+        vars_obj = {}
+
+    keys = set(map(str, vars_obj.keys()))
+    # các keys thường gặp của comments
+    comment_keys = {
+        "feedbackID", "feedback_id",
+        "displayCommentsContextEnableComment",
+        "commentsAfterCount", "commentsAfterCursor",
+        "after", "before", "first", "last"
+    }
+    if keys & comment_keys:
+        return True
+
+    return False
+
+def wait_first_comment_request(driver, baseline, timeout=12, poll=0.2):
+    import time as _t
+    end = _t.time() + timeout
+    last_n = 0
+    while _t.time() < end:
+        reqs = driver.execute_script("return (window.__gqlReqs||[])")
+        n = len(reqs)
+        if n != last_n:
+            # duyệt từ request mới nhất về cũ, chỉ trong phần tăng thêm sau baseline
+            for i in range(n-1, max(baseline-1, -1), -1):
+                req = reqs[i]
+                if _is_comments_gql(req):
+                    return req
+            last_n = n
+        _t.sleep(poll)
+    raise TimeoutError("Không thấy request comments sau khi set sort/click")
+
 
 # =========================
 # Replay GraphQL inside the page (keeps auth/cookies)

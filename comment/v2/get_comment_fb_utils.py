@@ -535,50 +535,149 @@ def match_comment_req(rec: dict):
             if keys & signs: return True
         except: pass
     return False
+import json, re
+
+CURSOR_KEYS = {
+    "end_cursor", "endCursor",
+    "cursor", "Cursor",
+    "expansion_token", "expansionToken",
+    "after",  # value thường là endCursor để trang sau
+}
+
+def _strip_xssi_globally(s: str) -> str:
+    s = s.replace("for (;;);", "")
+    s = s.replace(")]}',", "")
+    return s.strip()
+
+def _split_top_level_json_objects(s: str) -> list[str]:
+    out = []
+    start = None
+    depth = 0
+    in_str = False
+    esc = False
+
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                if depth == 0 and start is None:
+                    # không set start ở đây; chỉ set khi thấy { hoặc [
+                    pass
+            elif ch in '{[':
+                if depth == 0 and start is None:
+                    start = i
+                depth += 1
+            elif ch in '}]':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        out.append(s[start:i+1].strip())
+                        start = None
+    return out if out else [s.strip()]
+
+def _score_cursor_in_json(obj, depth=0):
+    """
+    Trả về (score, has_any), trong đó score cao hơn khi:
+    - có nhiều khóa 'cursor-like'
+    - cursor xuất hiện sâu hơn (ưu tiên block thực sự chứa page_info)
+    """
+    score = 0
+    has_any = False
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            k_l = str(k)
+            if k_l in CURSOR_KEYS:
+                # chỉ cộng điểm nếu value có ý nghĩa (non-empty / khác null / khác False)
+                meaningful = v is not None and v != "" and v is not False
+                if meaningful:
+                    has_any = True
+                    # trọng số theo độ sâu, ưu tiên sâu hơn
+                    score += 10 + depth
+            # tiếp tục đệ quy
+            sc, ha = _score_cursor_in_json(v, depth + 1)
+            score += sc
+            has_any = has_any or ha
+
+    elif isinstance(obj, list):
+        for it in obj:
+            sc, ha = _score_cursor_in_json(it, depth + 1)
+            score += sc
+            has_any = has_any or ha
+
+    # Nếu có cấu trúc quen thuộc page_info → bonus nhẹ
+    if isinstance(obj, dict) and "page_info" in obj:
+        score += 3
+
+    return score, has_any
 
 def clean_fb_resp_text(resp_text: str) -> str:
     """
-    Làm sạch response GraphQL của Facebook.
-    - Bỏ prefix chống XSSI như 'for (;;);' hoặc ')]}\','.
-    - Nếu có nhiều JSON nối liền nhau, ưu tiên block chứa 'cursor'
-      (để giữ lại phần chứa end_cursor / expansion_token / pagination info).
-    - Nếu không có block chứa 'cursor', fallback chọn block hợp lệ dài nhất.
+    Normalize FB GraphQL responses:
+    - Strip XSSI everywhere.
+    - Split safely into top-level JSON objects.
+    - Parse từng block và CHẤM ĐIỂM theo sự hiện diện 'cursor-like' (đệ quy).
+    - Ưu tiên block có score cao nhất; nếu không có, fallback block dài nhất.
+    - Guard HTML.
     """
     if not resp_text:
         return ""
 
-    s = resp_text.strip()
+    s = _strip_xssi_globally(resp_text)
 
-    # 1️⃣ Bỏ prefix chống XSSI (một số payload bắt đầu bằng for (;;); hoặc )]}',)
-    for prefix in ("for (;;);", ")]}',"):
-        if s.startswith(prefix):
-            s = s[len(prefix):].strip()
-
-    # 2️⃣ Nếu response có nhiều JSON nối liền nhau → tách bằng regex
-    parts = re.split(r'(?<=\})\s*(?=\{)', s)
-    if len(parts) > 1:
-        valid_blocks = []
-        for p in parts:
-            p = p.strip()
-            try:
-                json.loads(p)  # thử parse xem hợp lệ không
-                valid_blocks.append(p)
-            except json.JSONDecodeError:
-                continue
-
-        if valid_blocks:
-            # Ưu tiên block có 'cursor' (hoặc 'Cursor', 'expansion_token'…)
-            cursor_blocks = [p for p in valid_blocks if re.search(r'end_cursor|cursor|Cursor|expansion_token|expansionToken', p)]
-            if cursor_blocks:
-                s = max(cursor_blocks, key=len)
-            else:
-                s = max(valid_blocks, key=len)
-
-    # 3️⃣ Nếu response trả HTML (do login lỗi) thì raise để handle phía trên
-    if s.lstrip().startswith("<!DOCTYPE html") or s.lstrip().startswith("<html"):
+    s_l = s.lstrip()
+    if s_l.startswith("<!DOCTYPE html") or s_l.startswith("<html"):
         raise ValueError("Got HTML instead of JSON (maybe login expired)")
 
-    return s.strip()
+    parts = _split_top_level_json_objects(s)
+
+    parsed = []
+    for p in parts:
+        try:
+            obj = json.loads(p)
+            parsed.append((p, obj))
+        except json.JSONDecodeError:
+            continue
+
+    if not parsed:
+        # last chance: thử parse nguyên chuỗi
+        json.loads(s)
+        return s
+
+    # Chấm điểm cursor cho từng block
+    best_p = None
+    best_score = -1
+    any_has = False
+
+    for p, obj in parsed:
+        score, has_any = _score_cursor_in_json(obj)
+        if has_any:
+            any_has = True
+        if score > best_score:
+            best_score = score
+            best_p = p
+
+    if any_has:
+        return best_p.strip()
+
+    # Không block nào có cursor → fallback: block hợp lệ dài nhất
+    best_len = -1
+    best_p2 = None
+    for p, _ in parsed:
+        if len(p) > best_len:
+            best_len = len(p)
+            best_p2 = p
+    return best_p2.strip()
+
+
 
 def append_ndjson_line(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
@@ -622,3 +721,7 @@ def collect_reply_tokens_from_json(json_resp, out_map):
                 walk(v)
 
     walk(json_resp)
+def _normalize_id(item: dict) -> str | None:
+    print(item)
+    cid = item.get("id") or item.get("id")
+    return str(cid).strip() if cid else None
